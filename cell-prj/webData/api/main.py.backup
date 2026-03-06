@@ -1,0 +1,309 @@
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Union, Literal, Any
+import uvicorn
+import numpy as np
+import pandas as pd
+from onnx_model import get_onnx_model, load_onnx_model
+
+app = FastAPI(title="Virtual Cell Predictor")
+
+# CORS配置
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+'''
+    函数介绍：选择分析模式
+    入参：
+        AnalysisMode:分析模式
+        data:分析数据
+    出参：
+        anser:预测结果
+''' 
+
+# 根据不同分析模式路由到不同的处理函数
+@app.post("/api/Analysis")
+async def Analysis(request: Dict[str, Any]):
+    print(f"\n=== Request Received ===")
+    print(f"Request data: {request}")
+    print("========================\n")
+    
+    AnalysisMode = request.get("AnalysisMode")
+    print(f"AnalysisMode: {AnalysisMode}")
+    if AnalysisMode == 'single':
+        anser = await SingleAnalysis(request)
+    else:
+        BatchMethod = request.get("BatchMethod")
+        if BatchMethod == 'sweep':
+            anser = await BatchSweep(request)
+        else:
+            # 对于文件上传，返回一个提示信息，因为文件上传需要单独的接口
+            anser = {
+                'success': False,
+                'error': '文件上传请使用 /api/analysis/batch/upload 接口'
+            }
+
+    return anser
+        
+'''
+    函数介绍：单个分析
+    入参：
+        data:分析数据
+    出参：
+        anser:预测结果
+'''
+# 单个分析接口
+@app.post("/api/Analysis/Single")
+async def SingleAnalysis(request: Dict[str, Any]):
+    # 1. 读取数据
+    smiles = request.get("smiles")
+    time = request.get("time")
+    dose = request.get("dose")
+    cellLineMode = request.get("cellLineMode")
+    cellLineId = request.get("cellLineId")
+    customExpression = request.get("customExpression")
+
+    print(f"Single Analysis - smiles: {smiles}, time: {time}, dose: {dose}, cellLineMode: {cellLineMode}, cellLineId: {cellLineId}")
+
+    # 3. 使用纯ONNX模型进行预测
+    try:
+        model = get_onnx_model()
+        anser = model.predict(smiles, float(time), float(dose))
+        print(f"✅ ONNX模型预测成功，返回 {len(anser)} 个基因结果")
+    except RuntimeError as e:
+        if "模型尚未加载" in str(e):
+            raise HTTPException(
+                status_code=503,
+                detail="模型尚未加载，无法进行预测。请检查模型加载状态。"
+            )
+        raise
+    
+    # 打印所有预测结果
+    print(f"\n=== 基因表达预测结果 ===")
+    print(f"SMILES: {smiles}")
+    print(f"时间: {time}h, 剂量: {dose}μM")
+    print(f"{'基因ID':<10} {'表达值':<12} {'状态':<8}")
+    print("-" * 35)
+    for i, (gene_id, expression) in enumerate(anser):
+        if expression > 0:
+            status = "上调"
+        elif expression < 0:
+            status = "下调"
+        else:
+            status = "不变"
+        print(f"{gene_id:<10} {expression:>10.4f} {status:<8}")
+        
+        # 只显示前20个，避免输出过长
+        if i >= 19 and len(anser) > 20:
+            print(f"... 还有 {len(anser) - 20} 个基因结果")
+            break
+    print("=" * 35 + "\n")
+
+    # 3. 返回结果
+    return {
+        'success': True,
+        'mode': 'single',
+        'data': anser,
+        'metadata': {
+            'smiles': smiles,
+            'time': time,
+            'dose': dose,
+            'cellLineMode': cellLineMode,
+            'cellLineId': cellLineId
+        }
+    }
+
+'''
+    函数介绍：批量分析
+    入参：
+        data:分析数据
+    出参：
+        anser:预测结果
+'''
+# 参数扫描接口
+@app.post("/api/Analysis/Batch/Sweep")
+async def BatchSweep(request: Dict[str, Any]):
+    # 1. 读取数据
+    BatchMethod = "sweep"
+    SweepVariable = request.get("SweepVariable")
+    range_config = request.get("range")
+    start = range_config.get('start', 0)
+    end = range_config.get('end', 100)
+    steps = range_config.get('steps', 10)
+    fixedParamValue = request.get("fixedParamValue")
+    smiles = request.get("smiles")
+    cellLineId = request.get("cellLineId")
+        
+    print(f"Sweep Analysis - smiles: {smiles}, variable: {SweepVariable}, "
+              f"range: {start}-{end}, steps: {steps}")
+
+    # 2. 使用纯ONNX模型进行批量预测
+    try:
+        model = get_onnx_model()
+    except RuntimeError as e:
+        if "模型尚未加载" in str(e):
+            raise HTTPException(
+                status_code=503,
+                detail="模型尚未加载，无法进行预测。请检查模型加载状态。"
+            )
+        raise
+    
+    res = []
+    
+    # 生成扫描点
+    step_size = (end - start) / (steps - 1) if steps > 1 else 0
+    
+    for i in range(steps):
+        x_value = start + i * step_size
+        
+        # 根据扫描变量设置参数
+        if SweepVariable == 'time':
+            current_time = x_value
+            current_dose = float(fixedParamValue.get('dose', 10))
+        elif SweepVariable == 'dose':
+            current_time = float(fixedParamValue.get('time', 24))
+            current_dose = x_value
+        else:
+            current_time = float(fixedParamValue.get('time', 24))
+            current_dose = float(fixedParamValue.get('dose', 10))
+        
+        # 进行预测
+        try:
+            predictions = model.predict(smiles, current_time, current_dose)
+            
+            # 转换为扫描格式（只取前5个基因用于显示）
+            genes = {}
+            for gene_id, expression in predictions[:5]:
+                genes[gene_id] = expression
+            
+            res.append({
+                "xValue": round(x_value, 2),
+                "genes": genes
+            })
+            
+            # 打印当前扫描点的详细信息
+            print(f"  扫描点 {i+1}/{steps}: x={x_value:.2f}, time={current_time:.1f}h, dose={current_dose:.1f}μM")
+            print(f"    前5个基因: {[(gid, f'{exp:.3f}') for gid, exp in predictions[:5]]}")
+            
+        except Exception as e:
+            print(f"❌ 扫描点 {x_value} 预测失败: {str(e)}")
+            # 使用默认值
+            res.append({
+                "xValue": round(x_value, 2),
+                "genes": {
+                    "GENE_1": 0.0,
+                    "GENE_12": 0.0,
+                    "GENE_4": 0.0,
+                    "GENE_42": 0.0,
+                    "GENE_88": 0.0
+                }
+            })
+    
+    print(f"✅ 批量扫描完成，生成 {len(res)} 个数据点")
+
+    # 3. 返回结果
+    anser = {
+        "success": True,
+        "type": "sweep",
+        "data": res
+    }
+    return anser
+
+# 文件上传接口 - 兼容前端路径
+@app.post("/api/analysis/batch/upload")
+async def BatchUpload(file: UploadFile = File(...)):
+    # 1. 读取数据
+    BatchMethod = "upload"
+    
+    # 验证文件
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="未选择文件")
+    
+    # 检查文件大小
+    file_content = await file.read()
+    if len(file_content) == 0:
+        raise HTTPException(status_code=400, detail="文件为空")
+    
+    # 重置文件指针
+    await file.seek(0)
+    
+    # FastAPI中文件上传需要不同的处理方式
+    try:
+        if file.filename.endswith('.csv'):
+            df = pd.read_csv(file.file)
+        elif file.filename.endswith(('.xlsx', '.xls')):
+            df = pd.read_excel(file.file)
+        else:
+            raise HTTPException(status_code=400, detail="只支持CSV或Excel文件")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"文件读取失败: {str(e)}")
+    
+    
+    # 验证文件格式（必须三列）
+    if len(df.columns) != 3:
+        raise HTTPException(status_code=400, detail="文件必须包含恰好三列")
+    
+    # 模拟处理
+    processed_rows = len(df)
+    download_url = f"/download/{file.filename}"
+    
+    # 打印文件内容
+    print(f"\n=== 文件上传内容 ===")
+    print(f"文件名: {file.filename}")
+    print(f"文件大小: {len(file_content)} bytes")
+    print(f"数据形状: {df.shape}")
+    print(f"列名: {list(df.columns)}")
+    print(f"前5行数据:")
+    print(df.head())
+    print(f"数据类型:")
+    print(df.dtypes)
+    print("==================\n")
+    
+    # 构建返回结果
+    result = {
+        'success': True,
+        'type': 'upload',
+        'data': {
+            'processedRows': processed_rows,
+            'downloadUrl': download_url
+        }
+    }
+    
+    # 打印处理结果
+    print(f"\n=== 处理结果 ===")
+    print(f"处理状态: {'成功' if result['success'] else '失败'}")
+    print(f"处理类型: {result['type']}")
+    print(f"处理行数: {result['data']['processedRows']}")
+    print(f"下载链接: {result['data']['downloadUrl']}")
+    print(f"完整返回数据: {result}")
+    print("================\n")
+    
+    return result
+
+if __name__ == "__main__":
+    print("Loading xCUDO ONNX model and FastAPI starting server ...")
+    print("Please wait until server has fully started")
+    print("Server will be available at: http://localhost:8080")
+    print("Frontend can connect from: http://localhost:3000")
+    
+    # 加载纯ONNX模型
+    try:
+        load_onnx_model()
+        print("✅ xCUDO ONNX model loaded successfully!")
+    except Exception as e:
+        print(f"❌ Failed to load xCUDO ONNX model: {str(e)}")
+        print("💡 建议:")
+        print("   1. 检查模型文件路径是否正确")
+        print("   2. 更新 onnxruntime 到支持 ReduceL2 算子的版本")
+        print("   3. 或重新导出模型时避免使用 ReduceL2 算子")
+        print("⚠️  警告: 模型加载失败，服务器仍会启动但无法进行预测")
+        print("   请修复模型加载问题后再使用预测功能")
+    
+    # 即使模型加载失败，也启动服务器（方便调试）
+    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)

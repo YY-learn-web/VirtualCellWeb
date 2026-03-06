@@ -1,0 +1,2 @@
+# upload文件夹存的是用户上传的包含（smiles，dose，time）的csv文件或xlsx文件
+# results文件夹存的是用户上传的文件的预测结果csv和zip文件

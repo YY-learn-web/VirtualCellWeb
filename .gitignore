@@ -1,0 +1,26 @@
+TransCDR/
+MetabolomicsPred/backend/results/
+MetabolomicsPred/backend/upload_files/
+# ==========================================
+# 1. 忽略包含海量数据集的具体文件夹
+# ==========================================
+cell-prj/webData/otter-knowledge-main/mydata/
+cell-prj/webData/Sample_data/
+
+# ==========================================
+# 2. 忽略特定的大文件（报错日志中提到的散落文件）
+# ==========================================
+cell-prj/webData/otter-knowledge-main/DB_drugsRenew2vec.json
+cell-prj/webData/otter-knowledge-main/DB_drugsRenew_smiles_2176vec.csv
+cell-prj/webData/otter-knowledge-main/DB_drugsRenew2vec2176.json
+cell-prj/webData/CLUE_Depmap_ChemPert_ctrl_9035.h5ad
+
+# ==========================================
+# 3. 忽略常见的数据与缓存文件后缀（防患于未然）
+# ==========================================
+*.csv
+# *.json 
+*.h5ad
+*.h5
+__pycache__/
+.DS_Store

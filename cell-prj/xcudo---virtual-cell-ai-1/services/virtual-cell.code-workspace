@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"name": "webData",
+			"path": "../../webData"
+		},
+		{
+			"path": ".."
+		}
+	],
+	"settings": {}
+}

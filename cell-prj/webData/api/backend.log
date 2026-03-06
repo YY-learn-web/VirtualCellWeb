@@ -1,0 +1,108 @@
+INFO:     Will watch for changes in these directories: ['/Users/yd/codebuddy/cell-prj/webData/api']
+INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+INFO:     Started reloader process [41117] using WatchFiles
+Loading PyTorch model and FastAPI starting server ...
+Please wait until server has fully started
+Server will be available at: http://localhost:8080
+Frontend can connect from: http://localhost:3000
+INFO:     Started server process [41164]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+WARNING:  WatchFiles detected changes in 'model-app.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [41164]
+INFO:     Started server process [41207]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     127.0.0.1:57190 - "POST /api/analysis/batch/upload HTTP/1.1" 500 Internal Server Error
+ERROR:    Exception in ASGI application
+Traceback (most recent call last):
+  File "/opt/anaconda3/lib/python3.13/site-packages/uvicorn/protocols/http/httptools_impl.py", line 436, in run_asgi
+    result = await app(  # type: ignore[func-returns-value]
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        self.scope, self.receive, self.send
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/opt/anaconda3/lib/python3.13/site-packages/uvicorn/middleware/proxy_headers.py", line 78, in __call__
+    return await self.app(scope, receive, send)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/lib/python3.13/site-packages/fastapi/applications.py", line 1054, in __call__
+    await super().__call__(scope, receive, send)
+  File "/opt/anaconda3/lib/python3.13/site-packages/starlette/applications.py", line 113, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/opt/anaconda3/lib/python3.13/site-packages/starlette/middleware/errors.py", line 187, in __call__
+    raise exc
+  File "/opt/anaconda3/lib/python3.13/site-packages/starlette/middleware/errors.py", line 165, in __call__
+    await self.app(scope, receive, _send)
+  File "/opt/anaconda3/lib/python3.13/site-packages/starlette/middleware/cors.py", line 93, in __call__
+    await self.simple_response(scope, receive, send, request_headers=headers)
+  File "/opt/anaconda3/lib/python3.13/site-packages/starlette/middleware/cors.py", line 144, in simple_response
+    await self.app(scope, receive, send)
+  File "/opt/anaconda3/lib/python3.13/site-packages/starlette/middleware/exceptions.py", line 62, in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+  File "/opt/anaconda3/lib/python3.13/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/opt/anaconda3/lib/python3.13/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/opt/anaconda3/lib/python3.13/site-packages/starlette/routing.py", line 715, in __call__
+    await self.middleware_stack(scope, receive, send)
+  File "/opt/anaconda3/lib/python3.13/site-packages/starlette/routing.py", line 735, in app
+    await route.handle(scope, receive, send)
+  File "/opt/anaconda3/lib/python3.13/site-packages/starlette/routing.py", line 288, in handle
+    await self.app(scope, receive, send)
+  File "/opt/anaconda3/lib/python3.13/site-packages/starlette/routing.py", line 76, in app
+    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+  File "/opt/anaconda3/lib/python3.13/site-packages/starlette/_exception_handler.py", line 53, in wrapped_app
+    raise exc
+  File "/opt/anaconda3/lib/python3.13/site-packages/starlette/_exception_handler.py", line 42, in wrapped_app
+    await app(scope, receive, sender)
+  File "/opt/anaconda3/lib/python3.13/site-packages/starlette/routing.py", line 73, in app
+    response = await f(request)
+               ^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/lib/python3.13/site-packages/fastapi/routing.py", line 301, in app
+    raw_response = await run_endpoint_function(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+    )
+    ^
+  File "/opt/anaconda3/lib/python3.13/site-packages/fastapi/routing.py", line 212, in run_endpoint_function
+    return await dependant.call(**values)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/yd/codebuddy/cell-prj/webData/api/model-app.py", line 220, in BatchUpload
+    df = pd.read_csv(file.file)
+  File "/opt/anaconda3/lib/python3.13/site-packages/pandas/io/parsers/readers.py", line 1026, in read_csv
+    return _read(filepath_or_buffer, kwds)
+  File "/opt/anaconda3/lib/python3.13/site-packages/pandas/io/parsers/readers.py", line 620, in _read
+    parser = TextFileReader(filepath_or_buffer, **kwds)
+  File "/opt/anaconda3/lib/python3.13/site-packages/pandas/io/parsers/readers.py", line 1620, in __init__
+    self._engine = self._make_engine(f, self.engine)
+                   ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/lib/python3.13/site-packages/pandas/io/parsers/readers.py", line 1898, in _make_engine
+    return mapping[engine](f, **self.options)
+           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/lib/python3.13/site-packages/pandas/io/parsers/c_parser_wrapper.py", line 93, in __init__
+    self._reader = parsers.TextReader(src, **kwds)
+                   ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "parsers.pyx", line 581, in pandas._libs.parsers.TextReader.__cinit__
+pandas.errors.EmptyDataError: No columns to parse from file
+WARNING:  WatchFiles detected changes in 'model-app.py'. Reloading...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [41207]
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f48c60c0 (most recent call first):
+  <no Python frame>
+WARNING:  WatchFiles detected changes in 'model-app.py'. Reloading...
+Fatal Python error: init_sys_streams: can't initialize sys standard streams
+Python runtime state: core initialized
+OSError: [Errno 9] Bad file descriptor
+
+Current thread 0x00000001f48c60c0 (most recent call first):
+  <no Python frame>

@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+python-multipart
+celery
+redis
+torch
+pandas
+numpy
+matplotlib
+seaborn
+scikit-learn
+umap-learn
+magic-impute
+tqdm

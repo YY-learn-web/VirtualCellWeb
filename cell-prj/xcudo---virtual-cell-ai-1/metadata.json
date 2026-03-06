@@ -1,0 +1,5 @@
+{
+  "name": "ASCEND - Virtual Cell AI",
+  "description": "A high-performance AI platform for predicting compound-induced transcriptomic perturbations in virtual cell lines.",
+  "requestFramePermissions": []
+}
