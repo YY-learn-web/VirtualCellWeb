@@ -1,10 +1,34 @@
 import os
 import sys
+import shutil
+import traceback
+import json
+from urllib import request as urlrequest, parse as urlparse, error as urlerror
+import math
+from functools import lru_cache
 # 确保当前目录在 Python 路径中
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+METABO_BACKEND = os.path.join(REPO_ROOT, 'MetabolomicsPred', 'backend')
+if METABO_BACKEND not in sys.path:
+    sys.path.append(METABO_BACKEND)
+
+
+METABO_IMPORT_ERROR = None
+
+try:
+    from app.algorithms.scfea_core import run_scfea_training
+    from app.algorithms.scfea_analysis import run_downstream_analysis, generate_custom_diff_plot
+except Exception as exc:
+    METABO_IMPORT_ERROR = str(exc)
+    run_scfea_training = None
+    run_downstream_analysis = None
+    generate_custom_diff_plot = None
+    print(f'Metabolomics modules not loaded: {exc}')
+
 from ic50_tool import get_ic50_predictor, expression_to_vector
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Union, Literal, Any
@@ -16,6 +40,7 @@ import zipfile
 import io
 import time
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from onnx_model import ONNXModel,load_onnx_model
 
 
@@ -49,6 +74,12 @@ class SweepIC50Request(BaseModel):
     fixedParamValue: float
     range: SweepRange
     previewCount: int = Field(5, ge=1, le=50)
+
+
+class EnrichmentRequest(BaseModel):
+    geneIds: List[str]
+    library: str = Field("GO_Biological_Process_2021", min_length=1)
+    topN: int = Field(20, ge=1, le=200)
 
 ic50_predictor = get_ic50_predictor()
 
@@ -562,6 +593,94 @@ async def BatchUpload(file: UploadFile = File(...), cellLineId: Optional[str] = 
     return result
 
 # 文件下载接口
+# ?????????????
+# ???????????????
+@app.post("/api/analysis/batch/sweep/export")
+async def export_sweep_for_metabolomics(request: Dict[str, Any]):
+    sweep_variable = request.get("sweepVariable") or request.get("SweepVariable")
+    range_config = request.get("range") or {}
+    start = range_config.get("start")
+    end = range_config.get("end")
+    steps = range_config.get("steps")
+    fixed_param = request.get("fixedParamValue")
+    smiles = request.get("smiles")
+    cell_line = request.get("cellLineId")
+
+    if not smiles or start is None or end is None or steps is None or not sweep_variable:
+        raise HTTPException(status_code=400, detail="Missing sweep parameters")
+
+    steps = int(steps)
+    if steps < 1:
+        raise HTTPException(status_code=400, detail="Sweep steps must be >= 1")
+
+    step_size = (float(end) - float(start)) / (steps - 1) if steps > 1 else 0.0
+    model = load_onnx_model()
+
+    rows = []
+    for i in range(steps):
+        x_value = float(start) + i * step_size
+        if sweep_variable == "time":
+            current_time = x_value
+            current_dose = float(fixed_param)
+        else:
+            current_time = float(fixed_param)
+            current_dose = x_value
+
+        predictions = model.predict_single(smiles, current_time, current_dose, cell_line)
+        row = {"cell_id": f"sweep_{i + 1}"}
+        for gene_id, expression in predictions:
+            row[gene_id] = float(expression)
+        rows.append(row)
+
+    export_df = pd.DataFrame(rows)
+    file_id = uuid.uuid4().hex[:8]
+    export_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "batch/results",
+        f"metabolomics_sweep_{file_id}.csv",
+    )
+    os.makedirs(os.path.dirname(export_path), exist_ok=True)
+    export_df.to_csv(export_path, index=False)
+
+    return FileResponse(
+        path=export_path,
+        filename=f"metabolomics_sweep_{file_id}.csv",
+        media_type="text/csv",
+    )
+@app.get("/api/analysis/batch/export/{file_id}")
+async def export_batch_for_metabolomics(file_id: str):
+    result_csv = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "batch/results",
+        f"result_{file_id}.csv",
+    )
+    if not os.path.exists(result_csv):
+        raise HTTPException(status_code=404, detail="Batch result file not found")
+
+    try:
+        df = pd.read_csv(result_csv)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to read batch result file: {exc}")
+
+    gene_cols = [col for col in df.columns if col.startswith("GENE_")]
+    if not gene_cols:
+        raise HTTPException(status_code=400, detail="No gene columns found in batch result")
+
+    export_df = df[gene_cols].copy()
+    export_df.insert(0, "cell_id", [f"cell_{idx + 1}" for idx in range(len(export_df))])
+
+    export_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "batch/results",
+        f"metabolomics_{file_id}.csv",
+    )
+    export_df.to_csv(export_path, index=False)
+
+    return FileResponse(
+        path=export_path,
+        filename=f"metabolomics_{file_id}.csv",
+        media_type="text/csv",
+    )
 @app.get("/api/download/{filename}")
 async def download_file(filename: str):
     if not filename.endswith(".zip"):
@@ -582,6 +701,546 @@ async def download_file(filename: str):
         filename=filename,
         media_type="application/zip",
     )
+
+# --- Metabolomics (scFEA) integration ---
+METABO_UPLOAD_DIR = os.path.join(METABO_BACKEND, "upload_files")
+METABO_RESULTS_DIR = os.path.join(METABO_BACKEND, "results")
+METABO_ASSETS_DIR = os.path.join(METABO_BACKEND, "app", "assets")
+
+os.makedirs(METABO_UPLOAD_DIR, exist_ok=True)
+os.makedirs(METABO_RESULTS_DIR, exist_ok=True)
+
+app.mount("/api/metabolomics/results", StaticFiles(directory=METABO_RESULTS_DIR), name="metabolomics-results")
+
+METABO_TASK_STORE = {}
+
+
+def _ensure_metabolomics_ready():
+    if run_scfea_training is None or run_downstream_analysis is None:
+        detail = "Metabolomics backend not available"
+        if METABO_IMPORT_ERROR:
+            detail = f"{detail}: {METABO_IMPORT_ERROR}"
+        raise HTTPException(status_code=503, detail=detail)
+
+
+def process_metabolomics_task(job_id: str, input_file_path: str, params: dict):
+    output_dir = os.path.join(METABO_RESULTS_DIR, job_id)
+
+    try:
+        METABO_TASK_STORE[job_id] = {
+            "status": "TRAINING",
+            "progress": 10,
+            "message": "Training scFEA metabolomics model..."
+        }
+
+        epochs = params.get("epochs", 100)
+        use_imputation = params.get("imputation", False)
+        n_clusters = params.get("n_clusters", 4)
+
+        flux_file, balance_file = run_scfea_training(
+            input_file=input_file_path,
+            output_dir=output_dir,
+            assets_dir=METABO_ASSETS_DIR,
+            sc_imputation=use_imputation,
+            epochs=epochs
+        )
+
+        METABO_TASK_STORE[job_id] = {
+            "status": "ANALYZING",
+            "progress": 60,
+            "message": "Running downstream metabolomics analysis..."
+        }
+
+        result_paths = run_downstream_analysis(
+            flux_file=flux_file,
+            balance_file=balance_file,
+            output_dir=output_dir,
+            assets_dir=METABO_ASSETS_DIR,
+            n_clusters=n_clusters
+        )
+
+        METABO_TASK_STORE[job_id] = {
+            "status": "SUCCESS",
+            "progress": 100,
+            "message": "Analysis complete",
+            "result": result_paths
+        }
+
+    except Exception as exc:
+        traceback.print_exc()
+        METABO_TASK_STORE[job_id] = {
+            "status": "FAILURE",
+            "progress": 0,
+            "message": "Analysis failed",
+            "error": str(exc)
+        }
+
+
+@app.post("/api/metabolomics/analyze")
+async def start_metabolomics_analysis(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    epochs: int = Form(100),
+    imputation: bool = Form(False),
+    n_clusters: int = Form(4)
+):
+    _ensure_metabolomics_ready()
+    job_id = str(uuid.uuid4())
+
+    file_ext = os.path.splitext(file.filename)[1]
+    saved_filename = f"{job_id}{file_ext}"
+    file_path = os.path.join(METABO_UPLOAD_DIR, saved_filename)
+
+    try:
+        with open(file_path, "wb+") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"File save failed: {exc}")
+
+    METABO_TASK_STORE[job_id] = {
+        "status": "PENDING",
+        "progress": 0,
+        "message": "Task queued"
+    }
+
+    background_tasks.add_task(
+        process_metabolomics_task,
+        job_id,
+        file_path,
+        {"epochs": epochs, "imputation": imputation, "n_clusters": n_clusters}
+    )
+
+    return {
+        "job_id": job_id,
+        "task_id": job_id,
+        "message": "Metabolomics analysis started"
+    }
+
+
+@app.get("/api/metabolomics/status/{task_id}")
+async def get_metabolomics_status(task_id: str):
+    task_info = METABO_TASK_STORE.get(task_id)
+
+    if not task_info:
+        return {
+            "task_id": task_id,
+            "status": "UNKNOWN",
+            "message": "Task not found"
+        }
+
+    return {
+        "task_id": task_id,
+        "status": task_info["status"],
+        "progress": task_info.get("progress", 0),
+        "message": task_info.get("message", ""),
+        "result": task_info.get("result", None),
+        "error": task_info.get("error", None)
+    }
+
+
+@app.get("/api/metabolomics/diff_plot")
+async def get_metabolomics_diff_plot(job_id: str, c1: int, c2: int):
+    _ensure_metabolomics_ready()
+    output_dir = os.path.join(METABO_RESULTS_DIR, job_id)
+    try:
+        img_name, csv_name = generate_custom_diff_plot(output_dir, c1, c2)
+        return {
+            "status": "success",
+            "image": img_name,
+            "csv": csv_name
+        }
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# --- Gene Enrichment (Enrichr) ---
+ENRICHMENT_API_BASE = "https://maayanlab.cloud/Enrichr"
+ENRICHMENT_LIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "enrichment")
+ENRICHMENT_GO_LIBS = {
+    "GO_Biological_Process_2021": "GO_Biological_Process_2021.gmt",
+    "GO_Molecular_Function_2021": "GO_Molecular_Function_2021.gmt",
+    "GO_Cellular_Component_2021": "GO_Cellular_Component_2021.gmt",
+}
+os.makedirs(ENRICHMENT_LIB_DIR, exist_ok=True)
+
+
+def _load_entrez_symbol_map(assets_dir: str) -> Dict[str, str]:
+    candidates = [
+        "entrez_to_symbol.csv",
+        "entrez_to_symbol.tsv",
+        "geneid_to_symbol.csv",
+        "geneid_to_symbol.tsv",
+        "geneinfo_beta.txt",
+        "gene_info.txt",
+    ]
+    for name in candidates:
+        path = os.path.join(assets_dir, name)
+        if not os.path.exists(path):
+            continue
+        sep = "\t" if name.endswith(".tsv") or name.endswith(".txt") else ","
+        try:
+            df = pd.read_csv(path, sep=sep)
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        cols = [c.lower() for c in df.columns]
+        if "symbol" not in cols and "gene_symbol" not in cols:
+            continue
+        entrez_col = None
+        for candidate in ["entrez_id", "gene_id", "geneid", "entrez"]:
+            if candidate in cols:
+                entrez_col = df.columns[cols.index(candidate)]
+                break
+        if entrez_col is None:
+            entrez_col = df.columns[0]
+        symbol_col = df.columns[cols.index("symbol")] if "symbol" in cols else df.columns[cols.index("gene_symbol")]
+        mapping = (
+            df[[entrez_col, symbol_col]]
+            .dropna()
+            .astype(str)
+            .set_index(entrez_col)[symbol_col]
+            .to_dict()
+        )
+        if mapping:
+            return mapping
+    return {}
+
+
+def _normalize_enrichment_genes(gene_ids: List[str], assets_dir: str):
+    mapping = _load_entrez_symbol_map(assets_dir)
+    symbols: List[str] = []
+    unmapped: List[str] = []
+    for gene in gene_ids:
+        if gene is None:
+            continue
+        raw = str(gene).strip()
+        if not raw:
+            continue
+        key = raw[5:] if raw.startswith("GENE_") else raw
+        symbol = None
+        if mapping:
+            symbol = mapping.get(key)
+        if symbol:
+            symbols.append(symbol)
+        else:
+            if any(ch.isalpha() for ch in key):
+                symbols.append(key)
+            else:
+                unmapped.append(raw)
+    seen = set()
+    unique_symbols = []
+    for sym in symbols:
+        if sym not in seen:
+            seen.add(sym)
+            unique_symbols.append(sym)
+    return unique_symbols, unmapped
+
+
+def _enrichr_add_list(genes: List[str]) -> str:
+    payload = urlparse.urlencode({
+        "list": "\n".join(genes),
+        "description": "ASCEND transcriptomics enrichment"
+    }).encode("utf-8")
+    req = urlrequest.Request(f"{ENRICHMENT_API_BASE}/addList", data=payload, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    with urlrequest.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    user_list_id = data.get("userListId")
+    if not user_list_id:
+        raise ValueError("Enrichr did not return a userListId")
+    return str(user_list_id)
+
+
+def _enrichr_fetch_results(user_list_id: str, library: str):
+    query = urlparse.urlencode({"userListId": user_list_id, "backgroundType": library})
+    with urlrequest.urlopen(f"{ENRICHMENT_API_BASE}/enrich?{query}", timeout=20) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return data.get(library, [])
+
+
+def _download_go_library(library: str, dest_path: str):
+    url = f"{ENRICHMENT_API_BASE}/geneSetLibrary?mode=text&libraryName={urlparse.quote(library)}"
+    with urlrequest.urlopen(url, timeout=30) as resp:
+        content = resp.read()
+    with open(dest_path, "wb") as f:
+        f.write(content)
+
+
+def _ensure_go_library(library: str) -> str:
+    filename = ENRICHMENT_GO_LIBS.get(library)
+    if not filename:
+        raise ValueError(f"Offline GO library not supported: {library}")
+    path = os.path.join(ENRICHMENT_LIB_DIR, filename)
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        _download_go_library(library, path)
+    return path
+
+
+@lru_cache(maxsize=8)
+def _load_gmt_library(path: str) -> Dict[str, List[str]]:
+    gene_sets = {}
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) < 3:
+                continue
+            term = parts[0]
+            genes = [g for g in parts[2:] if g]
+            if genes:
+                gene_sets[term] = genes
+    if not gene_sets:
+        raise ValueError("GMT library is empty")
+    return gene_sets
+
+
+def _log_comb(n: int, k: int) -> float:
+    if k < 0 or k > n:
+        return float("-inf")
+    return math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)
+
+
+def _logsumexp(log_values: List[float]) -> float:
+    if not log_values:
+        return float("-inf")
+    max_log = max(log_values)
+    if max_log == float("-inf"):
+        return max_log
+    total = sum(math.exp(v - max_log) for v in log_values)
+    return max_log + math.log(total)
+
+
+def _hypergeom_sf(k: int, M: int, n: int, N: int) -> float:
+    # Survival function for hypergeometric: P[X >= k]
+    if k <= 0:
+        return 1.0
+    max_k = min(n, N)
+    if k > max_k:
+        return 0.0
+    log_denom = _log_comb(M, N)
+    log_terms = []
+    for i in range(k, max_k + 1):
+        log_num = _log_comb(n, i) + _log_comb(M - n, N - i)
+        log_terms.append(log_num - log_denom)
+    log_p = _logsumexp(log_terms)
+    if log_p == float("-inf"):
+        return 0.0
+    return min(max(math.exp(log_p), 0.0), 1.0)
+
+
+def _bh_fdr(p_values: List[float]) -> List[float]:
+    n = len(p_values)
+    if n == 0:
+        return []
+    order = sorted(range(n), key=lambda i: p_values[i])
+    adj = [0.0] * n
+    prev = 1.0
+    for rank, idx in enumerate(order, start=1):
+        p = p_values[idx]
+        val = min(p * n / rank, 1.0)
+        prev = min(prev, val)
+        adj[idx] = prev
+    # ensure monotonicity
+    for i in range(n - 2, -1, -1):
+        adj[i] = min(adj[i], adj[i + 1])
+    return adj
+
+
+def _run_go_enrichment(genes: List[str], library: str, top_n: int) -> List[Dict[str, Any]]:
+    gmt_path = _ensure_go_library(library)
+    gene_sets = _load_gmt_library(gmt_path)
+    gene_universe = set()
+    for gset in gene_sets.values():
+        gene_universe.update(gset)
+    if not gene_universe:
+        raise ValueError("GO library gene universe is empty")
+
+    query = [g for g in genes if g in gene_universe]
+    if len(query) < 5:
+        raise ValueError("Not enough mapped genes for GO enrichment after filtering to library")
+
+    M = len(gene_universe)
+    N = len(set(query))
+    results = []
+    for term, gset in gene_sets.items():
+        gs = set(gset)
+        overlap = list(set(query).intersection(gs))
+        k = len(overlap)
+        if k == 0:
+            continue
+        n = len(gs)
+        p_val = _hypergeom_sf(k, M, n, N)
+        expected = (N * n) / M
+        combined = -math.log(max(p_val, 1e-300)) * (k / max(expected, 1e-9))
+        results.append({
+            "term": term,
+            "pValue": p_val,
+            "adjP": None,
+            "combinedScore": combined,
+            "genes": overlap
+        })
+
+    pvals = [r["pValue"] for r in results]
+    adj = _bh_fdr(pvals)
+    for i, val in enumerate(adj):
+        results[i]["adjP"] = val
+
+    results.sort(key=lambda r: r["adjP"] if r["adjP"] is not None else r["pValue"])
+    return results[:top_n]
+
+
+@app.post("/api/enrichment/run")
+async def run_gene_enrichment(request: EnrichmentRequest):
+    if not request.geneIds:
+        raise HTTPException(status_code=400, detail="geneIds is required")
+
+    genes, unmapped = _normalize_enrichment_genes(request.geneIds, METABO_ASSETS_DIR)
+    if len(genes) < 5:
+        raise HTTPException(
+            status_code=400,
+            detail="Not enough mapped genes for enrichment. Check gene ID mapping."
+        )
+
+    results = []
+    if request.library in ENRICHMENT_GO_LIBS:
+        try:
+            results = _run_go_enrichment(genes, request.library, request.topN)
+        except urlerror.URLError as exc:
+            raise HTTPException(status_code=503, detail=f"GO library download failed: {exc}")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Offline GO enrichment failed: {exc}")
+    else:
+        try:
+            user_list_id = _enrichr_add_list(genes)
+            raw_results = _enrichr_fetch_results(user_list_id, request.library)
+        except urlerror.URLError as exc:
+            raise HTTPException(status_code=503, detail=f"Enrichment service unavailable: {exc}")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Enrichment failed: {exc}")
+
+        for row in raw_results:
+            if not row or len(row) < 6:
+                continue
+            term = row[1]
+            p_value = float(row[2]) if row[2] is not None else 1.0
+            combined_score = float(row[4]) if len(row) > 4 and row[4] is not None else None
+            overlap_genes = row[5] if len(row) > 5 else ""
+            adj_p = float(row[6]) if len(row) > 6 and row[6] is not None else None
+            gene_list = [g for g in str(overlap_genes).replace(";", ",").split(",") if g]
+            results.append({
+                "term": term,
+                "pValue": p_value,
+                "adjP": adj_p,
+                "combinedScore": combined_score,
+                "genes": gene_list
+            })
+
+        results = results[:request.topN]
+    return {
+        "success": True,
+        "library": request.library,
+        "data": results,
+        "unmapped": unmapped
+    }
+
+
+def _get_gene_columns(df: pd.DataFrame) -> List[str]:
+    gene_cols = [col for col in df.columns if str(col).startswith("GENE_")]
+    if gene_cols:
+        return gene_cols
+    meta_cols = {"smiles", "time", "dose", "cellLineId", "cell_id"}
+    candidate_cols = [col for col in df.columns if str(col) not in meta_cols]
+    numeric_cols = []
+    for col in candidate_cols:
+        series = pd.to_numeric(df[col], errors="coerce")
+        if series.notna().any():
+            numeric_cols.append(col)
+    return numeric_cols
+
+
+def _summarize_gene_matrix(df: pd.DataFrame) -> List[List[Union[str, float]]]:
+    gene_cols = _get_gene_columns(df)
+    if not gene_cols:
+        raise ValueError("No gene columns found in batch result")
+    gene_df = df[gene_cols].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0)
+    means = gene_df.mean(axis=0)
+    return [[str(gene_id), float(means[gene_id])] for gene_id in gene_cols]
+
+
+@app.get("/api/enrichment/batch/summary/{file_id}")
+async def get_batch_enrichment_summary(file_id: str):
+    result_csv = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "batch/results",
+        f"result_{file_id}.csv",
+    )
+    if not os.path.exists(result_csv):
+        raise HTTPException(status_code=404, detail="Batch result file not found")
+    try:
+        df = pd.read_csv(result_csv)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to read batch result file: {exc}")
+    if df.empty:
+        raise HTTPException(status_code=400, detail="Batch result file is empty")
+    try:
+        data = _summarize_gene_matrix(df)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "success": True,
+        "data": data,
+        "processedRows": len(df)
+    }
+
+
+@app.post("/api/enrichment/sweep/summary")
+async def get_sweep_enrichment_summary(request: Dict[str, Any]):
+    sweep_variable = request.get("sweepVariable") or request.get("SweepVariable")
+    range_config = request.get("range") or {}
+    start = range_config.get("start")
+    end = range_config.get("end")
+    steps = range_config.get("steps")
+    fixed_param = request.get("fixedParamValue")
+    smiles = request.get("smiles")
+    cell_line = request.get("cellLineId")
+
+    if not smiles or start is None or end is None or steps is None or not sweep_variable:
+        raise HTTPException(status_code=400, detail="Missing sweep parameters")
+
+    steps = int(steps)
+    if steps < 1:
+        raise HTTPException(status_code=400, detail="Sweep steps must be >= 1")
+
+    step_size = (float(end) - float(start)) / (steps - 1) if steps > 1 else 0.0
+    model = load_onnx_model()
+
+    rows = []
+    for i in range(steps):
+        x_value = float(start) + i * step_size
+        if sweep_variable == "time":
+            current_time = x_value
+            current_dose = float(fixed_param)
+        else:
+            current_time = float(fixed_param)
+            current_dose = x_value
+
+        predictions = model.predict_single(smiles, current_time, current_dose, cell_line)
+        row = {"cell_id": f"sweep_{i + 1}"}
+        for gene_id, expression in predictions:
+            row[gene_id] = float(expression)
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    try:
+        data = _summarize_gene_matrix(df)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "success": True,
+        "data": data,
+        "processedRows": len(df)
+    }
 
 if __name__ == "__main__":
     print("Loading xCUDO ONNX model and FastAPI starting server ...")

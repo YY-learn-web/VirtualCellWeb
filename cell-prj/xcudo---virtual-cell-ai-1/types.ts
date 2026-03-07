@@ -147,3 +147,77 @@ export enum AppState {
   SUCCESS = 'SUCCESS',
   ERROR = 'ERROR'
 }
+
+// --- METABOLOMICS (scFEA) TYPES ---
+
+export interface MetabolomicsTaskResponse {
+  job_id: string;
+  task_id: string;
+  message: string;
+}
+
+export type MetabolomicsTaskStatus =
+  | 'PENDING'
+  | 'TRAINING'
+  | 'ANALYZING'
+  | 'SUCCESS'
+  | 'FAILURE'
+  | 'UNKNOWN';
+
+export interface MetabolomicsTaskResult {
+  files: Record<string, string>;
+  images: {
+    umap_cluster: string;
+    umap_stress: string;
+    heatmap_module: string;
+    heatmap_pathway: string;
+    volcano: string;
+    stress_corr: string;
+  };
+}
+
+export interface MetabolomicsTaskStatusResponse {
+  task_id: string;
+  status: MetabolomicsTaskStatus;
+  progress: number;
+  message: string;
+  result?: MetabolomicsTaskResult;
+  error?: string;
+}
+
+export interface MetabolomicsAnalyzeParams {
+  file: File;
+  epochs: number;
+  imputation: boolean;
+  nClusters: number;
+}
+
+export interface MetabolomicsDiffPlotResponse {
+  status: 'success' | 'error';
+  image: string;
+  csv: string;
+  error?: string;
+}
+
+// --- Gene Enrichment TYPES ---
+
+export interface EnrichmentRequest {
+  geneIds: string[];
+  library: string;
+  topN?: number;
+}
+
+export interface EnrichmentTerm {
+  term: string;
+  pValue: number;
+  adjP?: number;
+  combinedScore?: number;
+  genes?: string[];
+}
+
+export interface EnrichmentResponse {
+  success: boolean;
+  library: string;
+  data: EnrichmentTerm[];
+  unmapped?: string[];
+}

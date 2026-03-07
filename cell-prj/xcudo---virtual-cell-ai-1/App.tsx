@@ -20,6 +20,8 @@ import {
 import { Button } from './components/Button';
 import { Input, RangeSlider } from './components/Input';
 import { ResultsChart, SweepLineChart } from './components/ResultsChart';
+import { MetabolomicsPage } from './components/MetabolomicsPage';
+import { EnrichmentPage } from './components/EnrichmentPage';
 import { 
   AppState, 
   PredictionRequest, 
@@ -45,6 +47,7 @@ import { ASCENDService } from './services/api2';
 const App: React.FC = () => {
   // --- Theme State ---
   const [isDark, setIsDark] = useState<boolean>(true);
+  const [activePage, setActivePage] = useState<'transcriptomics' | 'metabolomics' | 'enrichment'>('transcriptomics');
 
   // --- App Logic State ---
   const [mode, setMode] = useState<AnalysisMode>('single');
@@ -147,6 +150,16 @@ const App: React.FC = () => {
   const [cellLineMode, setCellLineMode] = useState<'preset' | 'custom'>('preset');
   const [selectedCellLine, setSelectedCellLine] = useState<string>(PRESET_CELL_LINES[0].id);
   const [singleResults, setSingleResults] = useState<GeneExpressionResult[] | null>(null);
+  const [metabolomicsSeedFile, setMetabolomicsSeedFile] = useState<File | null>(null);
+  const [metabolomicsSeedLabel, setMetabolomicsSeedLabel] = useState<string | null>(null);
+  const [enrichmentSeedResults, setEnrichmentSeedResults] = useState<GeneExpressionResult[] | null>(null);
+  const [enrichmentSeedLabel, setEnrichmentSeedLabel] = useState<string | null>(null);
+  const [enrichmentLoading, setEnrichmentLoading] = useState<boolean>(false);
+  const enrichmentContextLabel = enrichmentSeedLabel
+    ? enrichmentSeedLabel
+    : singleResults
+      ? selectedCellLine + ' | ' + time + 'h | ' + dose + 'uM'
+      : undefined;
 
   // --- Batch Mode Inputs ---
   const [batchMethod, setBatchMethod] = useState<BatchMethod>('sweep');
@@ -178,6 +191,22 @@ const App: React.FC = () => {
     }
   }, [isDark]);
 
+  useEffect(() => {
+    const syncFromHash = () => {
+      const hash = window.location.hash.replace('#', '');
+      const resolved =
+        hash === 'metabolomics'
+          ? 'metabolomics'
+          : hash === 'enrichment'
+            ? 'enrichment'
+            : 'transcriptomics';
+      setActivePage(resolved);
+    };
+    syncFromHash();
+    window.addEventListener('hashchange', syncFromHash);
+    return () => window.removeEventListener('hashchange', syncFromHash);
+  }, []);
+
   // --- Handlers ---
 
   const handlePredict = async (e: React.FormEvent) => {
@@ -185,6 +214,8 @@ const App: React.FC = () => {
     setAppState(AppState.LOADING);
     setErrorMsg(null);
     setSingleResults(null);
+    setEnrichmentSeedResults(null);
+    setEnrichmentSeedLabel(null);
     setIc50Result(null);
     setIc50Error(null);
     setIc50Loading(false);
@@ -259,8 +290,163 @@ const App: React.FC = () => {
     }
   };
 
-  // --- UI Components ---
+  const handleNavigate = (page: 'transcriptomics' | 'metabolomics' | 'enrichment') => {
+    const hash = page === 'metabolomics' ? '#metabolomics' : page === 'enrichment' ? '#enrichment' : '#transcriptomics';
+    if (window.location.hash !== hash) {
+      window.location.hash = hash;
+    }
+    setActivePage(page);
+  };
 
+  const buildTranscriptomicsCsv = (results: GeneExpressionResult[]) => {
+    const header = ['cell_id', ...results.map((r) => r.geneId)].join(',');
+    const values = results.map((r) => {
+      const val = Number.isFinite(r.expressionLevel) ? r.expressionLevel : 0;
+      return val.toString();
+    });
+    const rowId = `sample_${selectedCellLine}_${time}h_${dose}uM`;
+    const row = [rowId, ...values].join(',');
+    return `${header}\n${row}\n`;
+  };
+
+  const buildTranscriptomicsFile = () => {
+    if (!singleResults?.length) return null;
+    const csv = buildTranscriptomicsCsv(singleResults);
+    const safeCell = selectedCellLine.replace(/[^a-zA-Z0-9_-]+/g, '_');
+    const filename = `transcriptomics_${safeCell}_${time}h_${dose}uM.csv`;
+    const file = new File([csv], filename, { type: 'text/csv' });
+    return { file, filename };
+  };
+
+  const downloadFile = (file: File) => {
+    const url = URL.createObjectURL(file);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = file.name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleExportSweepTranscriptomics = async (action: 'download' | 'send') => {
+    if (!sweepResults?.length) {
+      setErrorMsg('Sweep results are not ready yet.');
+      return;
+    }
+    const payload: BatchSweepRequest = {
+      smiles: batchSmiles,
+      cellLineId: batchCellLine,
+      sweepVariable: sweepVar,
+      fixedParamValue: batchFixedParam,
+      range: { start: sweepStart, end: sweepEnd, steps: sweepSteps }
+    };
+    try {
+      const blob = await ASCENDService.fetchSweepMetabolomicsCsv(payload);
+      const filename = `metabolomics_sweep_${sweepVar}_${sweepStart}-${sweepEnd}_${sweepSteps}.csv`;
+      const file = new File([blob], filename, { type: 'text/csv' });
+      setMetabolomicsSeedFile(file);
+      setMetabolomicsSeedLabel(filename);
+      if (action === 'download') {
+        downloadFile(file);
+      } else {
+        handleNavigate('metabolomics');
+      }
+    } catch (err: any) {
+      setErrorMsg(err?.message ?? 'Failed to prepare metabolomics sweep input.');
+    }
+  };
+  const handleExportBatchTranscriptomics = async (action: 'download' | 'send') => {
+    if (!uploadResult?.fileId) {
+      setErrorMsg('Batch transcriptomics results are not ready yet.');
+      return;
+    }
+    try {
+      const blob = await ASCENDService.fetchBatchMetabolomicsCsv(uploadResult.fileId);
+      const filename = `metabolomics_${uploadResult.fileId}.csv`;
+      const file = new File([blob], filename, { type: 'text/csv' });
+      setMetabolomicsSeedFile(file);
+      setMetabolomicsSeedLabel(filename);
+      if (action === 'download') {
+        downloadFile(file);
+      } else {
+        handleNavigate('metabolomics');
+      }
+    } catch (err: any) {
+      setErrorMsg(err?.message ?? 'Failed to prepare metabolomics input.');
+    }
+  };
+  const handleExportTranscriptomics = (action: 'download' | 'send') => {
+    const payload = buildTranscriptomicsFile();
+    if (!payload) {
+      setErrorMsg('Transcriptomics results are not ready yet.');
+      return;
+    }
+    setMetabolomicsSeedFile(payload.file);
+    setMetabolomicsSeedLabel(payload.filename);
+    if (action === 'download') {
+      downloadFile(payload.file);
+    } else {
+      handleNavigate('metabolomics');
+    }
+  };
+
+  const handleSendSingleToEnrichment = () => {
+    if (!singleResults?.length) {
+      setErrorMsg('Transcriptomics results are not ready yet.');
+      return;
+    }
+    setEnrichmentSeedResults(singleResults);
+    setEnrichmentSeedLabel(selectedCellLine + ' | ' + time + 'h | ' + dose + 'uM');
+    handleNavigate('enrichment');
+  };
+
+  const handleSendBatchToEnrichment = async () => {
+    if (!uploadResult?.fileId) {
+      setErrorMsg('Batch transcriptomics results are not ready yet.');
+      return;
+    }
+    setEnrichmentLoading(true);
+    setErrorMsg(null);
+    try {
+      const data = await ASCENDService.fetchBatchEnrichmentSummary(uploadResult.fileId);
+      setEnrichmentSeedResults(data);
+      setEnrichmentSeedLabel('Batch Upload | ' + uploadResult.fileId + ' | ' + uploadResult.processedRows + ' samples');
+      handleNavigate('enrichment');
+    } catch (err: any) {
+      setErrorMsg(err?.message ?? 'Failed to prepare enrichment input.');
+    } finally {
+      setEnrichmentLoading(false);
+    }
+  };
+
+  const handleSendSweepToEnrichment = async () => {
+    if (!sweepResults?.length) {
+      setErrorMsg('Sweep results are not ready yet.');
+      return;
+    }
+    setEnrichmentLoading(true);
+    setErrorMsg(null);
+    try {
+      const payload: BatchSweepRequest = {
+        smiles: batchSmiles,
+        cellLineId: batchCellLine,
+        sweepVariable: sweepVar,
+        fixedParamValue: batchFixedParam,
+        range: { start: sweepStart, end: sweepEnd, steps: sweepSteps }
+      };
+      const data = await ASCENDService.fetchSweepEnrichmentSummary(payload);
+      setEnrichmentSeedResults(data);
+      setEnrichmentSeedLabel('Sweep ' + sweepVar + ' | ' + sweepStart + '-' + sweepEnd + ' (' + sweepSteps + ' steps)');
+      handleNavigate('enrichment');
+    } catch (err: any) {
+      setErrorMsg(err?.message ?? 'Failed to prepare enrichment input.');
+    } finally {
+      setEnrichmentLoading(false);
+    }
+  };
+
+  // --- UI Components ---
   const Header = () => (
     <header className="sticky top-0 z-50 w-full border-b border-slate-200 dark:border-slate-800 bg-white/90 dark:bg-[#020617]/90 backdrop-blur-md transition-colors duration-300">
       <div className="container mx-auto px-4 h-16 flex items-center justify-between">
@@ -271,6 +457,37 @@ const App: React.FC = () => {
           <span className="text-xl font-bold tracking-tight text-slate-900 dark:text-white">
             ASCEND <span className="text-slate-400 dark:text-slate-600 text-sm font-mono font-normal ml-2 hidden sm:inline-block">| Virtual Cell AI</span>
           </span>
+        </div>
+        <div className="flex-1 flex justify-center">
+          <div className="flex items-center gap-1 rounded-xl border border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/80 p-1">
+            <button
+              type="button"
+              onClick={() => handleNavigate('transcriptomics')}
+              className={activePage === 'transcriptomics'
+                ? 'px-4 py-1.5 text-xs font-semibold rounded-lg transition-all bg-cyan-50 dark:bg-cyan-950/40 text-cyan-700 dark:text-cyan-300 shadow-sm'
+                : 'px-4 py-1.5 text-xs font-semibold rounded-lg transition-all text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200'}
+            >
+              Transcriptomics
+            </button>
+            <button
+              type="button"
+              onClick={() => handleNavigate('enrichment')}
+              className={activePage === 'enrichment'
+                ? 'px-4 py-1.5 text-xs font-semibold rounded-lg transition-all bg-cyan-50 dark:bg-cyan-950/40 text-cyan-700 dark:text-cyan-300 shadow-sm'
+                : 'px-4 py-1.5 text-xs font-semibold rounded-lg transition-all text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200'}
+            >
+              Enrichment
+            </button>
+            <button
+              type="button"
+              onClick={() => handleNavigate('metabolomics')}
+              className={activePage === 'metabolomics'
+                ? 'px-4 py-1.5 text-xs font-semibold rounded-lg transition-all bg-cyan-50 dark:bg-cyan-950/40 text-cyan-700 dark:text-cyan-300 shadow-sm'
+                : 'px-4 py-1.5 text-xs font-semibold rounded-lg transition-all text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200'}
+            >
+              Metabolomics
+            </button>
+          </div>
         </div>
         <div className="flex items-center gap-4">
           <div className="hidden md:flex items-center gap-4 text-xs font-mono text-slate-500 dark:text-slate-400">
@@ -296,6 +513,12 @@ const App: React.FC = () => {
       <Header />
 
       <main className="container mx-auto px-4 py-8">
+        {activePage === 'metabolomics' ? (
+          <MetabolomicsPage isDark={isDark} transcriptomicsSeedFile={metabolomicsSeedFile} transcriptomicsSeedLabel={metabolomicsSeedLabel} />
+        ) : activePage === 'enrichment' ? (
+          <EnrichmentPage isDark={isDark} differentialResults={enrichmentSeedResults || singleResults} contextLabel={enrichmentContextLabel} />
+        ) : (
+          <>
         
         {/* Intro Section */}
         <div className="mb-10 text-center max-w-3xl mx-auto">
@@ -626,6 +849,39 @@ const App: React.FC = () => {
                        <ResultsChart data={singleResults} isDark={isDark} />
                     </div>
                     <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 rounded-xl shadow-md space-y-4">
+                      <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+                        <div>
+                          <h3 className="text-lg font-bold text-slate-900 dark:text-white">Transcriptomics Output</h3>
+                          <p className="text-sm text-slate-500 dark:text-slate-400">
+                            Download the full gene expression prediction or send it directly to the Metabolomics module.
+                          </p>
+                        </div>
+                        <div className="flex flex-wrap gap-3">
+                          <Button
+                            variant="secondary"
+                            className="flex items-center gap-2"
+                            onClick={() => handleExportTranscriptomics('download')}
+                          >
+                            <Download className="w-4 h-4" /> Download CSV
+                          </Button>
+                          <Button
+                            variant="outline"
+                            className="flex items-center gap-2"
+                            onClick={handleSendSingleToEnrichment}
+                          >
+                            <Dna className="w-4 h-4" /> Send to Enrichment
+                          </Button>
+                          <Button
+                            variant="outline"
+                            className="flex items-center gap-2"
+                            onClick={() => handleExportTranscriptomics('send')}
+                          >
+                            <FlaskConical className="w-4 h-4" /> Send to Metabolomics
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 rounded-xl shadow-md space-y-4">
                       <div className="flex items-center justify-between gap-4">
                         <div>
                           <h3 className="text-lg font-bold text-slate-900 dark:text-white">
@@ -706,6 +962,34 @@ const App: React.FC = () => {
                       </div>
                       <div className="relative">
                          <SweepLineChart data={sweepResults} isDark={isDark} xAxisLabel={sweepVar === 'dose' ? 'Concentration (μM)' : 'Time (Hours)'} />
+                      </div>
+                      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 rounded-xl shadow-md space-y-4">
+                        <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+                          <div>
+                            <h3 className="text-lg font-bold text-slate-900 dark:text-white">Metabolomics Input (Sweep)</h3>
+                            <p className="text-sm text-slate-500 dark:text-slate-400">
+                              Export the full gene matrix for all sweep points to use in metabolomics prediction.
+                            </p>
+                          </div>
+                          <div className="flex flex-wrap gap-3">
+
+                            <Button
+                              variant="outline"
+                              className="flex items-center gap-2"
+                              onClick={() => handleExportSweepTranscriptomics('send')}
+                            >
+                              <FlaskConical className="w-4 h-4" /> Send to Metabolomics
+                            </Button>
+                            <Button
+                              variant="outline"
+                              className="flex items-center gap-2"
+                              onClick={handleSendSweepToEnrichment}
+                              isLoading={enrichmentLoading}
+                            >
+                              <Dna className="w-4 h-4" /> Send to Enrichment
+                            </Button>
+                          </div>
+                        </div>
                       </div>
                       <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 rounded-xl shadow-md space-y-4">
                         <div className="flex items-center justify-between gap-4">
@@ -814,6 +1098,27 @@ const App: React.FC = () => {
                         >
                            <Download className="w-4 h-4" /> Download Results (.ZIP)
                         </Button>
+                        <div className="mt-6 flex flex-wrap gap-3 justify-center">
+
+                          <Button
+                            variant="outline"
+                            className="flex items-center gap-2"
+                            onClick={() => handleExportBatchTranscriptomics('send')}
+                          >
+                            <FlaskConical className="w-4 h-4" /> Send to Metabolomics
+                          </Button>
+                          <Button
+                            variant="outline"
+                            className="flex items-center gap-2"
+                            onClick={handleSendBatchToEnrichment}
+                            isLoading={enrichmentLoading}
+                          >
+                            <Dna className="w-4 h-4" /> Send to Enrichment
+                          </Button>
+                        </div>
+                        {enrichmentLoading && (
+                          <p className="text-xs text-slate-500 dark:text-slate-400 mt-2">Preparing enrichment input...</p>
+                        )}
                      </div>
 
                      <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 rounded-xl shadow-md space-y-4">
@@ -903,6 +1208,8 @@ const App: React.FC = () => {
 
           </div>
         </div>
+          </>
+        )}
       </main>
     </div>
   );

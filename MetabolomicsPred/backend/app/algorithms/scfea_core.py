@@ -26,6 +26,60 @@ DEFAULT_PARAMS = {
     'EPOCH': 100
 }
 
+def _load_entrez_symbol_map(assets_dir: str) -> dict:
+    """
+    Load Entrez ID -> Gene Symbol mapping from assets if provided.
+    Expected files (first found wins):
+      - entrez_to_symbol.csv / .tsv
+      - geneid_to_symbol.csv / .tsv
+    Columns: entrez_id (or gene_id) and symbol (case-insensitive).
+    """
+    candidates = [
+        "entrez_to_symbol.csv",
+        "entrez_to_symbol.tsv",
+        "geneid_to_symbol.csv",
+        "geneid_to_symbol.tsv",
+        "geneinfo_beta.txt",
+        "gene_info.txt",
+    ]
+    for name in candidates:
+        path = os.path.join(assets_dir, name)
+        if not os.path.exists(path):
+            continue
+        if name.endswith(".tsv") or name.endswith(".txt"):
+            sep = "\t"
+        else:
+            sep = ","
+        df = pd.read_csv(path, sep=sep)
+        if df.empty:
+            continue
+        cols = [c.lower() for c in df.columns]
+        if "symbol" not in cols and "gene_symbol" not in cols:
+            continue
+        # Identify Entrez column
+        entrez_col = None
+        for candidate in ["entrez_id", "gene_id", "geneid", "entrez"]:
+            if candidate in cols:
+                entrez_col = df.columns[cols.index(candidate)]
+                break
+        if entrez_col is None:
+            # Fallback: first column
+            entrez_col = df.columns[0]
+        if "symbol" in cols:
+            symbol_col = df.columns[cols.index("symbol")]
+        else:
+            symbol_col = df.columns[cols.index("gene_symbol")]
+        mapping = (
+            df[[entrez_col, symbol_col]]
+            .dropna()
+            .astype(str)
+            .set_index(entrez_col)[symbol_col]
+            .to_dict()
+        )
+        if mapping:
+            return mapping
+    return {}
+
 
 def myLoss(m, c, lamb1, lamb2, lamb3, lamb4, geneScale=None, moduleScale=None):
     # balance constrain
@@ -89,7 +143,38 @@ def run_scfea_training(
     print("Loading data...")
     geneExpr = pd.read_csv(input_file, index_col=0)
     #geneExpr = geneExpr.T
-    geneExpr = geneExpr * 1.0
+    # Coerce all values to numeric to avoid object dtype issues
+    geneExpr = geneExpr.apply(pd.to_numeric, errors='coerce')
+    geneExpr = geneExpr.replace([np.inf, -np.inf], np.nan)
+    if geneExpr.isna().values.any():
+        geneExpr = geneExpr.fillna(0)
+    geneExpr = geneExpr.astype(float, errors='ignore')
+
+    # If input uses GENE_<EntrezID>, map to gene symbols required by scFEA
+    geneExpr.columns = geneExpr.columns.astype(str)
+    if all(col.startswith("GENE_") for col in geneExpr.columns):
+        mapping = _load_entrez_symbol_map(assets_dir)
+        if not mapping:
+            raise ValueError(
+                "Input columns are GENE_<EntrezID> but no Entrez->Symbol mapping found. "
+                "Provide a mapping file in assets (entrez_to_symbol.csv/tsv) with columns "
+                "entrez_id and symbol."
+            )
+        keep_cols = []
+        new_cols = []
+        for col in geneExpr.columns:
+            entrez_id = col.replace("GENE_", "")
+            symbol = mapping.get(entrez_id)
+            if symbol:
+                keep_cols.append(col)
+                new_cols.append(symbol)
+        if not keep_cols:
+            raise ValueError("Entrez->Symbol mapping produced no gene symbols. Check mapping file.")
+        geneExpr = geneExpr[keep_cols]
+        geneExpr.columns = new_cols
+        # Aggregate duplicate symbols (mean)
+        if len(set(geneExpr.columns)) != len(geneExpr.columns):
+            geneExpr = geneExpr.groupby(geneExpr.columns, axis=1).mean()
 
     if sc_imputation:
         magic_operator = magic.MAGIC()
@@ -121,6 +206,11 @@ def run_scfea_training(
     data_gene_all = set(geneExpr.columns)
     gene_overlap = list(data_gene_all.intersection(module_gene_all))
     gene_overlap.sort()
+    if len(gene_overlap) == 0:
+        raise ValueError(
+            "No overlapping genes between input and scFEA reference. "
+            "Ensure input columns are gene symbols used by scFEA."
+        )
 
     # Load Stoichiometry Matrix
     cmMat = pd.read_csv(cm_file, sep=',', header=None).values
@@ -161,15 +251,18 @@ def run_scfea_training(
 
     geneExprDf.index = geneExprDf['Module_Gene']
     geneExprDf.drop('Module_Gene', axis='columns', inplace=True)
-    X = geneExprDf.values.T
-    X = torch.FloatTensor(X).to(device)
+    # Ensure numeric matrix for torch conversion
+    geneExprDf = geneExprDf.apply(pd.to_numeric, errors='coerce').replace([np.inf, -np.inf], np.nan)
+    geneExprDf = geneExprDf.fillna(0).astype(float, errors='ignore')
+    X = np.asarray(geneExprDf.values.T, dtype=np.float64)
+    X = torch.from_numpy(X).to(device)
 
     # Constraint of module variation
     df = geneExprDf.copy()
     df.index = [i.split('_')[0] for i in df.index]
     df.index = df.index.astype(int)
     module_scale = df.groupby(df.index).sum().T
-    module_scale = torch.FloatTensor(module_scale.values / moduleLen)
+    module_scale = torch.from_numpy((module_scale.values / moduleLen).astype(np.float64))
 
     # ================= Train NN =================
     print("Training neural network...")
