@@ -3,7 +3,8 @@ import {
   BarChart3,
   Database,
   Download,
-  FlaskConical
+  FlaskConical,
+  Share2
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -36,6 +37,11 @@ export const EnrichmentPage: React.FC<EnrichmentPageProps> = ({
   const [results, setResults] = useState<EnrichmentTerm[]>([]);
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [ppiImage, setPpiImage] = useState<string | null>(null);
+  const [ppiLink, setPpiLink] = useState<string | null>(null);
+  const [ppiStats, setPpiStats] = useState<{ filtered: number; mapped: number } | null>(null);
+  const [ppiLoading, setPpiLoading] = useState(false);
+  const [ppiError, setPpiError] = useState<string | null>(null);
 
   const availableLibraries = [
     'GO_Biological_Process_2021',
@@ -87,6 +93,35 @@ export const EnrichmentPage: React.FC<EnrichmentPageProps> = ({
       setResults([]);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const runStringNetwork = async () => {
+    if (!differentialResults?.length) {
+      setPpiError('No transcriptomics results available. Run prediction first.');
+      return;
+    }
+    setPpiLoading(true);
+    setPpiError(null);
+    try {
+      const response = await ASCENDService.fetchStringNetwork({
+        genes: differentialResults,
+        minExpression: 1.5,
+        species: 9606,
+        requiredScore: 400,
+        networkType: 'functional',
+        maxGenes: 200
+      });
+      setPpiImage(response.image);
+      setPpiLink(response.link ?? null);
+      setPpiStats({ filtered: response.filteredCount, mapped: response.mappedCount });
+    } catch (err: any) {
+      setPpiError(err?.message ?? 'STRING network failed.');
+      setPpiImage(null);
+      setPpiLink(null);
+      setPpiStats(null);
+    } finally {
+      setPpiLoading(false);
     }
   };
 
@@ -261,6 +296,53 @@ export const EnrichmentPage: React.FC<EnrichmentPageProps> = ({
               Run enrichment to visualize pathway hits.
             </div>
           )}
+
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-6 shadow-md space-y-4">
+            <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+              <div>
+                <h2 className="text-lg font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                  <Share2 className="w-5 h-5 text-cyan-600 dark:text-cyan-400" />
+                  STRING PPI Network
+                </h2>
+                <p className="text-sm text-slate-500 dark:text-slate-400">
+                  Builds a protein-protein interaction graph from high-expression genes.
+                </p>
+              </div>
+              <Button onClick={runStringNetwork} isLoading={ppiLoading} className="justify-center">
+                Generate PPI
+              </Button>
+            </div>
+
+            {ppiStats && (
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Filtered genes: {ppiStats.filtered} · Mapped to STRING: {ppiStats.mapped}
+              </p>
+            )}
+
+            {ppiError && (
+              <div className="p-3 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-500/40 text-sm text-red-600 dark:text-red-300">
+                {ppiError}
+              </div>
+            )}
+
+            {ppiImage && (
+              <div className="space-y-3">
+                {ppiLink && (
+                  <a
+                    href={ppiLink}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-xs text-cyan-600 dark:text-cyan-400 underline"
+                  >
+                    Open interactive STRING view
+                  </a>
+                )}
+                <div className="w-full overflow-x-auto rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/40 p-2">
+                  <img src={ppiImage} alt="STRING network" className="w-full h-auto" />
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </>

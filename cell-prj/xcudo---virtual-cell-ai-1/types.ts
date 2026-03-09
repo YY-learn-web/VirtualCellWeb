@@ -221,3 +221,20 @@ export interface EnrichmentResponse {
   data: EnrichmentTerm[];
   unmapped?: string[];
 }
+
+export interface StringNetworkRequest {
+  genes: GeneExpressionResult[];
+  minExpression?: number;
+  species?: number;
+  requiredScore?: number;
+  networkType?: 'functional' | 'physical';
+  maxGenes?: number;
+}
+
+export interface StringNetworkResponse {
+  success: boolean;
+  filteredCount: number;
+  mappedCount: number;
+  image: string;
+  link?: string | null;
+}

@@ -1,5 +1,5 @@
 
-import { PredictionRequest, PredictionResponse, GeneExpressionResult, BatchSweepRequest, BatchResponse, SweepPoint, IC50PredictionRequest, IC50Prediction, BatchIC50Request, BatchIC50Response, SweepIC50Request, SweepIC50Response, MetabolomicsAnalyzeParams, MetabolomicsTaskResponse, MetabolomicsTaskStatusResponse, MetabolomicsDiffPlotResponse, EnrichmentRequest, EnrichmentResponse } from '../types';
+import { PredictionRequest, PredictionResponse, GeneExpressionResult, BatchSweepRequest, BatchResponse, SweepPoint, IC50PredictionRequest, IC50Prediction, BatchIC50Request, BatchIC50Response, SweepIC50Request, SweepIC50Response, MetabolomicsAnalyzeParams, MetabolomicsTaskResponse, MetabolomicsTaskStatusResponse, MetabolomicsDiffPlotResponse, EnrichmentRequest, EnrichmentResponse, StringNetworkRequest, StringNetworkResponse } from '../types';
 
 /**
  * API SERVICE - Connects to FastAPI Backend
@@ -276,6 +276,14 @@ export const ASCENDService = {
       throw new Error(result.error || 'Failed to load sweep enrichment summary.');
     }
     return transformBackendData(result.data);
+  },
+
+  fetchStringNetwork: async (request: StringNetworkRequest): Promise<StringNetworkResponse> => {
+    const response = await apiRequest('/api/enrichment/string_network', request);
+    if (!response.success) {
+      throw new Error(response.error || 'STRING network failed.');
+    }
+    return response;
   },
 
   runEnrichment: async (request: EnrichmentRequest): Promise<EnrichmentResponse> => {

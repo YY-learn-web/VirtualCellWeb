@@ -6,6 +6,7 @@ import json
 from urllib import request as urlrequest, parse as urlparse, error as urlerror
 import math
 from functools import lru_cache
+import base64
 # 确保当前目录在 Python 路径中
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -80,6 +81,15 @@ class EnrichmentRequest(BaseModel):
     geneIds: List[str]
     library: str = Field("GO_Biological_Process_2021", min_length=1)
     topN: int = Field(20, ge=1, le=200)
+
+
+class StringNetworkRequest(BaseModel):
+    genes: List[GeneExpressionPayload]
+    minExpression: float = Field(1.5)
+    species: int = Field(9606, ge=1)
+    requiredScore: int = Field(400, ge=0, le=1000)
+    networkType: Literal["functional", "physical"] = "functional"
+    maxGenes: int = Field(200, ge=5, le=1000)
 
 ic50_predictor = get_ic50_predictor()
 
@@ -864,6 +874,8 @@ ENRICHMENT_GO_LIBS = {
 }
 os.makedirs(ENRICHMENT_LIB_DIR, exist_ok=True)
 
+STRING_API_BASE = "https://string-db.org/api"
+
 
 def _load_entrez_symbol_map(assets_dir: str) -> Dict[str, str]:
     candidates = [
@@ -936,6 +948,21 @@ def _normalize_enrichment_genes(gene_ids: List[str], assets_dir: str):
             seen.add(sym)
             unique_symbols.append(sym)
     return unique_symbols, unmapped
+
+
+def _map_gene_id_to_symbol(gene_id: str, mapping: Dict[str, str]) -> Optional[str]:
+    if gene_id is None:
+        return None
+    raw = str(gene_id).strip()
+    if not raw:
+        return None
+    key = raw[5:] if raw.startswith("GENE_") else raw
+    symbol = mapping.get(key) if mapping else None
+    if symbol:
+        return symbol
+    if any(ch.isalpha() for ch in key):
+        return key
+    return None
 
 
 def _enrichr_add_list(genes: List[str]) -> str:
@@ -1240,6 +1267,75 @@ async def get_sweep_enrichment_summary(request: Dict[str, Any]):
         "success": True,
         "data": data,
         "processedRows": len(df)
+    }
+
+
+@app.post("/api/enrichment/string_network")
+async def get_string_network(request: StringNetworkRequest):
+    if not request.genes:
+        raise HTTPException(status_code=400, detail="genes is required")
+
+    mapping = _load_entrez_symbol_map(METABO_ASSETS_DIR)
+    filtered = [g for g in request.genes if g.expressionLevel is not None and g.expressionLevel > request.minExpression]
+    if not filtered:
+        raise HTTPException(status_code=400, detail="No genes passed the expression filter")
+
+    filtered.sort(key=lambda g: g.expressionLevel, reverse=True)
+    filtered = filtered[: request.maxGenes]
+    symbols = []
+    for item in filtered:
+        sym = _map_gene_id_to_symbol(item.geneId, mapping)
+        if sym:
+            symbols.append(sym)
+    if not symbols:
+        raise HTTPException(status_code=400, detail="No valid gene symbols found after mapping")
+
+    identifiers = "\r".join(symbols)
+    payload = urlparse.urlencode({
+        "identifiers": identifiers,
+        "species": str(request.species),
+        "required_score": str(request.requiredScore),
+        "network_type": request.networkType,
+        "caller_identity": "virtual-cell-ai",
+    }).encode("utf-8")
+
+    try:
+        svg_url = f"{STRING_API_BASE}/svg/network"
+        req = urlrequest.Request(svg_url, data=payload, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        with urlrequest.urlopen(req, timeout=30) as resp:
+            svg_data = resp.read()
+
+        link_url = f"{STRING_API_BASE}/tsv/get_link"
+        link_req = urlrequest.Request(link_url, data=payload, method="POST")
+        link_req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        link = None
+        with urlrequest.urlopen(link_req, timeout=30) as resp:
+            text = resp.read().decode("utf-8", errors="ignore").strip()
+            if text:
+                # Skip header if present
+                lines = [line for line in text.splitlines() if line.strip()]
+                if len(lines) > 1:
+                    parts = lines[1].split("\t")
+                    if parts:
+                        link = parts[0]
+
+        image_b64 = base64.b64encode(svg_data).decode("utf-8")
+        image_uri = f"data:image/svg+xml;base64,{image_b64}"
+
+    except urlerror.HTTPError as exc:
+        raise HTTPException(status_code=503, detail=f"STRING API error: {exc}")
+    except urlerror.URLError as exc:
+        raise HTTPException(status_code=503, detail=f"STRING API unavailable: {exc}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"STRING network failed: {exc}")
+
+    return {
+        "success": True,
+        "filteredCount": len(filtered),
+        "mappedCount": len(symbols),
+        "image": image_uri,
+        "link": link
     }
 
 if __name__ == "__main__":
