@@ -75,6 +75,7 @@ export interface BatchResponse {
   success: boolean;
   type: BatchMethod;
   data: SweepPoint[] | BatchUploadData;
+  topGenes?: string[];
 }
 
 export interface BatchUploadData {
@@ -235,6 +236,75 @@ export interface StringNetworkResponse {
   success: boolean;
   filteredCount: number;
   mappedCount: number;
+  genesUsed?: string[];
   image: string;
   link?: string | null;
+}
+
+export interface SingleMetabolomicsRequest {
+  expression: GeneExpressionResult[];
+  epochs?: number;
+  imputation?: boolean;
+}
+
+export interface SingleMetabolomicsResponse {
+  success: boolean;
+  jobId: string;
+  flux: Record<string, number>;
+  balance: Record<string, number>;
+  files: {
+    flux: string;
+    balance: string;
+  };
+}
+
+export interface KeyGeneScore {
+  gene: string;
+  score: number;
+  expressionScore: number;
+  enrichmentScore: number;
+  ppiScore: number;
+  metabolomicsScore: number;
+}
+
+export interface KeyGeneRequest {
+  expression: GeneExpressionResult[];
+  enrichment: EnrichmentTerm[];
+  ppiGenes: string[];
+  metabolomicsFlux: Record<string, number>;
+  topN?: number;
+}
+
+export interface KeyGeneResponse {
+  success: boolean;
+  topGenes: KeyGeneScore[];
+}
+
+export interface BatchSnapshotRequest {
+  smiles: string;
+  cellLineId: string;
+  sweepVariable: SweepVariable;
+  fixedParamValue: number;
+  range: {
+    start: number;
+    end: number;
+    steps: number;
+  };
+  snapshotValue: number;
+}
+
+export interface BatchSnapshotResponse {
+  success: boolean;
+  pointIndex: number;
+  cellId: string;
+  xValue: number;
+  time: number;
+  dose: number;
+  expression: GeneExpressionResult[];
+}
+
+export interface BatchMetabolomicsSnapshotResponse {
+  success: boolean;
+  cellId: string;
+  flux: Record<string, number>;
 }

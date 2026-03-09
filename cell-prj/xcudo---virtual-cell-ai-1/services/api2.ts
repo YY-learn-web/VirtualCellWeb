@@ -1,5 +1,5 @@
 
-import { PredictionRequest, PredictionResponse, GeneExpressionResult, BatchSweepRequest, BatchResponse, SweepPoint, IC50PredictionRequest, IC50Prediction, BatchIC50Request, BatchIC50Response, SweepIC50Request, SweepIC50Response, MetabolomicsAnalyzeParams, MetabolomicsTaskResponse, MetabolomicsTaskStatusResponse, MetabolomicsDiffPlotResponse, EnrichmentRequest, EnrichmentResponse, StringNetworkRequest, StringNetworkResponse } from '../types';
+import { PredictionRequest, PredictionResponse, GeneExpressionResult, BatchSweepRequest, BatchResponse, SweepPoint, IC50PredictionRequest, IC50Prediction, BatchIC50Request, BatchIC50Response, SweepIC50Request, SweepIC50Response, MetabolomicsAnalyzeParams, MetabolomicsTaskResponse, MetabolomicsTaskStatusResponse, MetabolomicsDiffPlotResponse, EnrichmentRequest, EnrichmentResponse, StringNetworkRequest, StringNetworkResponse, SingleMetabolomicsRequest, SingleMetabolomicsResponse, KeyGeneRequest, KeyGeneResponse, BatchSnapshotRequest, BatchSnapshotResponse, BatchMetabolomicsSnapshotResponse } from '../types';
 
 /**
  * API SERVICE - Connects to FastAPI Backend
@@ -286,6 +286,56 @@ export const ASCENDService = {
     return response;
   },
 
+  getBatchSnapshot: async (request: BatchSnapshotRequest): Promise<BatchSnapshotResponse> => {
+    const response = await apiRequest('/api/workflow/batch/snapshot', request);
+    if (!response.success) {
+      throw new Error(response.error || 'Batch snapshot failed.');
+    }
+    return response;
+  },
+
+  getBatchMetabolomicsSnapshot: async (jobId: string, pointIndex: number): Promise<BatchMetabolomicsSnapshotResponse> => {
+    const response = await fetch(`${API_BASE_URL}/api/workflow/batch/metabolomics_snapshot?job_id=${encodeURIComponent(jobId)}&point_index=${pointIndex}`);
+    if (!response.ok) {
+      let detail = `HTTP error! status: ${response.status}`;
+      try {
+        const err = await response.json();
+        if (err?.detail) {
+          detail = `${detail} - ${err.detail}`;
+        }
+      } catch (e) {
+        // ignore
+      }
+      throw new Error(detail);
+    }
+    const result = await response.json();
+    if (!result.success) {
+      throw new Error(result.error || 'Batch metabolomics snapshot failed.');
+    }
+    return result;
+  },
+
+  runSingleWorkflowMetabolomics: async (request: SingleMetabolomicsRequest): Promise<SingleMetabolomicsResponse> => {
+    const payload = {
+      expression: request.expression.map(({ geneId, expressionLevel }) => ({ geneId, expressionLevel })),
+      epochs: request.epochs ?? 100,
+      imputation: request.imputation ?? false
+    };
+    const response = await apiRequest('/api/workflow/single/metabolomics', payload);
+    if (!response.success) {
+      throw new Error(response.error || 'Single metabolomics workflow failed.');
+    }
+    return response;
+  },
+
+  identifyKeyGenes: async (request: KeyGeneRequest): Promise<KeyGeneResponse> => {
+    const response = await apiRequest('/api/workflow/single/key_genes', request);
+    if (!response.success) {
+      throw new Error(response.error || 'Key gene analysis failed.');
+    }
+    return response;
+  },
+
   runEnrichment: async (request: EnrichmentRequest): Promise<EnrichmentResponse> => {
     const response = await apiRequest('/api/enrichment/run', request);
     if (!response.success) {
@@ -294,3 +344,5 @@ export const ASCENDService = {
     return response;
   }
 };
+
+

@@ -17,7 +17,7 @@ import {
 } from 'recharts';
 import { Button } from './Button';
 import { Input } from './Input';
-import { ASCENDService } from '../services/api2';
+import { ASCENDService } from '../services/apiLive';
 import { GeneExpressionResult, EnrichmentResponse, EnrichmentTerm } from '../types';
 
 interface EnrichmentPageProps {

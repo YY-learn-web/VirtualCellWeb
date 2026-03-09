@@ -2,9 +2,9 @@
 import sys
 import random
 import numpy as np
+import onnxruntime as ort
 import pandas as pd
 import joblib
-import onnxruntime as ort
 from typing import List, Tuple, Optional
 from tqdm import tqdm
 import re
@@ -30,10 +30,10 @@ if OTTER_PATH not in sys.path:
 try:
     from inference import get_embedding
     OTTER_AVAILABLE = True
-    print("✅ 成功导入otter-knowledge模块")
+    print("otter-knowledge module loaded successfully.")
 except ImportError as e:
     OTTER_AVAILABLE = False
-    print(f"⚠️ 无法导入otter-knowledge模块: {str(e)}")
+    print(f"Failed to import otter-knowledge module: {str(e)}")
 
 # 全局变量存储模型和数据
 _onnx_session = None
@@ -80,7 +80,7 @@ class ONNXModel:
         # 使用otter-knowledge计算特征向量
         embedding = get_embedding(smile)
         if embedding is not None:
-            print(f"✅ 成功使用otter-knowledge计算药物特征")
+            print("Drug embedding computed with otter-knowledge.")
             """for i in range(len(embedding)):
                 print(f"向量维度: {len(embedding)}, 数字: {embedding[i]}")"""
             return embedding
@@ -298,7 +298,10 @@ def load_onnx_model():
         raise FileNotFoundError(f"ONNX模型文件不存在: {ONNX_MODEL_PATH}")
     
     # 尝试使用不同的执行提供者
-    providers = ['CoreMLExecutionProvider', 'CPUExecutionProvider']
+    available_providers = ort.get_available_providers()
+    providers = [provider for provider in ['CoreMLExecutionProvider', 'CPUExecutionProvider'] if provider in available_providers]
+    if not providers:
+        providers = ['CPUExecutionProvider']
     session_options = ort.SessionOptions()
     
     try:
@@ -307,23 +310,23 @@ def load_onnx_model():
             sess_options=session_options,
             providers=providers
         )
-        print(f"✅ ONNX模型加载成功: {ONNX_MODEL_PATH}")
+        print(f"ONNX model loaded successfully: {ONNX_MODEL_PATH}")
     except Exception as e:
-        print(f"⚠️  使用 CoreML 失败，尝试仅使用 CPU: {str(e)}")
+        print(f"CoreML provider unavailable; retrying with CPU only: {str(e)}")
         try:
             _onnx_session = ort.InferenceSession(
                 ONNX_MODEL_PATH,
                 sess_options=session_options,
                 providers=['CPUExecutionProvider']
             )
-            print(f"✅ ONNX模型加载成功（使用CPU）: {ONNX_MODEL_PATH}")
+            print(f"ONNX model loaded successfully with CPU: {ONNX_MODEL_PATH}")
         except Exception as e2:
             raise RuntimeError(f"无法加载ONNX模型: {str(e2)}")
     
     # 3. 加载基因数据
     _gene_dict = pd.read_csv(GENE_FILE, header=None, index_col=0).to_dict('index')
     _gene_ids = list(_gene_dict.keys())
-    print(f"✅ 基因数据加载成功: {len(_gene_dict)} 个基因")
+    print(f"Gene metadata loaded successfully: {len(_gene_dict)} genes")
     # 4. 加载标准化器
     _time_scaler = joblib.load(TIME_SCALER_PATH)
     _dose_scaler = joblib.load(DOSE_SCALER_PATH)
@@ -332,3 +335,4 @@ def load_onnx_model():
     # [W:onnxruntime:, execution_frame.cc:874 VerifyOutputSizes] Expected shape from model of {-1,978} does not match actual shape of {978} for output prediction
 
     return ONNXModel(_onnx_session, _gene_dict, _gene_ids, _time_scaler, _dose_scaler)
+

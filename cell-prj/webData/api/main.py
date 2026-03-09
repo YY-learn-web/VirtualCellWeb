@@ -1,302 +1,103 @@
-import os
-import sys
-import shutil
-import traceback
-import json
-from urllib import request as urlrequest, parse as urlparse, error as urlerror
-import math
-from functools import lru_cache
+from __future__ import annotations
+
 import base64
-# 确保当前目录在 Python 路径中
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
-METABO_BACKEND = os.path.join(REPO_ROOT, 'MetabolomicsPred', 'backend')
-if METABO_BACKEND not in sys.path:
-    sys.path.append(METABO_BACKEND)
-
-
-METABO_IMPORT_ERROR = None
-
-try:
-    from app.algorithms.scfea_core import run_scfea_training
-    from app.algorithms.scfea_analysis import run_downstream_analysis, generate_custom_diff_plot
-except Exception as exc:
-    METABO_IMPORT_ERROR = str(exc)
-    run_scfea_training = None
-    run_downstream_analysis = None
-    generate_custom_diff_plot = None
-    print(f'Metabolomics modules not loaded: {exc}')
-
-from ic50_tool import get_ic50_predictor, expression_to_vector
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Union, Literal, Any
-import uvicorn
-import numpy as np
-import pandas as pd
-import uuid
-import zipfile
 import io
-import time
+import json
+import logging
+import math
+import os
+import shutil
+import sys
+import traceback
+import uuid
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from threading import Lock
+from time import perf_counter
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from onnx_model import ONNXModel,load_onnx_model
+from pydantic import BaseModel, Field
 
+try:
+    from scipy.stats import hypergeom
+except Exception:
+    hypergeom = None
 
+LOGGER = logging.getLogger("virtual-cell-api")
+if not LOGGER.handlers:
+    logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="Virtual Cell Predictor")
+API_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = API_DIR.parents[2]
+WEBDATA_DIR = API_DIR.parent
 
-class GeneExpressionPayload(BaseModel):
-    geneId: str
-    expressionLevel: float
+BATCH_UPLOAD_DIR = WEBDATA_DIR / "batch" / "uploads"
+BATCH_RESULTS_DIR = WEBDATA_DIR / "batch" / "results"
+SWEEP_EXPORT_DIR = WEBDATA_DIR / "batch" / "sweep"
+IC50_EXPORT_DIR = WEBDATA_DIR / "batch" / "ic50"
 
-class IC50Request(BaseModel):
-    cellLineId: str
-    smiles: Optional[str] = None
-    expression: List[GeneExpressionPayload]
-    metadata: Optional[Dict[str, Any]] = None
+METAB_BACKEND_DIR = PROJECT_ROOT / "MetabolomicsPred" / "backend"
+METAB_RESULTS_DIR = API_DIR / "metabolomics_results"
+METAB_UPLOAD_DIR = API_DIR / "metabolomics_uploads"
+METAB_ASSETS_DIR = METAB_BACKEND_DIR / "app" / "assets"
 
-class BatchIC50Request(BaseModel):
-    fileId: str = Field(..., min_length=1)
-    cellLineId: Optional[str] = None
-    previewCount: int = Field(5, ge=1, le=50)
+ENRICH_LOCAL_DIR = API_DIR / "assets" / "enrichment"
+ENRICH_LIBRARY_FILES = {
+    "GO_Biological_Process_2021": "GO_Biological_Process_2021.gmt",
+    "GO_Molecular_Function_2021": "GO_Molecular_Function_2021.gmt",
+    "GO_Cellular_Component_2021": "GO_Cellular_Component_2021.gmt",
+}
 
-class SweepRange(BaseModel):
-    start: float
-    end: float
-    steps: int = Field(..., ge=1)
+for folder in (
+    BATCH_UPLOAD_DIR,
+    BATCH_RESULTS_DIR,
+    SWEEP_EXPORT_DIR,
+    IC50_EXPORT_DIR,
+    METAB_RESULTS_DIR,
+    METAB_UPLOAD_DIR,
+):
+    folder.mkdir(parents=True, exist_ok=True)
 
-class SweepIC50Request(BaseModel):
-    smiles: str
-    cellLineId: str
-    sweepVariable: Literal["time", "dose"]
-    fixedParamValue: float
-    range: SweepRange
-    previewCount: int = Field(5, ge=1, le=50)
+if str(API_DIR) not in sys.path:
+    sys.path.insert(0, str(API_DIR))
+if str(METAB_BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(METAB_BACKEND_DIR))
 
+ONNX_IMPORT_ERROR: Optional[str] = None
+IC50_IMPORT_ERROR: Optional[str] = None
+METAB_IMPORT_ERROR: Optional[str] = None
 
-class EnrichmentRequest(BaseModel):
-    geneIds: List[str]
-    library: str = Field("GO_Biological_Process_2021", min_length=1)
-    topN: int = Field(20, ge=1, le=200)
+try:
+    from onnx_model import load_onnx_model
+except Exception as exc:
+    load_onnx_model = None
+    ONNX_IMPORT_ERROR = str(exc)
 
+import pandas as pd
 
-class StringNetworkRequest(BaseModel):
-    genes: List[GeneExpressionPayload]
-    minExpression: float = Field(1.5)
-    species: int = Field(9606, ge=1)
-    requiredScore: int = Field(400, ge=0, le=1000)
-    networkType: Literal["functional", "physical"] = "functional"
-    maxGenes: int = Field(200, ge=5, le=1000)
+try:
+    from ic50_tool import expression_to_vector, get_ic50_predictor
+except Exception as exc:
+    expression_to_vector = None
+    get_ic50_predictor = None
+    IC50_IMPORT_ERROR = str(exc)
 
-ic50_predictor = get_ic50_predictor()
+try:
+    from app.algorithms.scfea_analysis import generate_custom_diff_plot, run_downstream_analysis
+    from app.algorithms.scfea_core import run_scfea_training
+except Exception as exc:
+    generate_custom_diff_plot = None
+    run_downstream_analysis = None
+    run_scfea_training = None
+    METAB_IMPORT_ERROR = str(exc)
 
-@app.post("/api/ic50/predict")
-async def predict_ic50(request: IC50Request):
-    if not request.expression:
-        raise HTTPException(status_code=400, detail="Expression payload is empty")
-    try:
-        vector = expression_to_vector(
-            [gene.model_dump() for gene in request.expression]
-        )
-        result = ic50_predictor.predict(vector, request.model_dump())
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"IC50 prediction failed: {exc}")
-    return {"success": True, "data": result}
-
-
-@app.post("/api/ic50/batch/predict")
-async def predict_ic50_batch(request: BatchIC50Request):
-    file_id = request.fileId
-    if not file_id:
-        raise HTTPException(status_code=400, detail="Missing fileId")
-
-    result_csv = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "batch/results",
-        f"result_{file_id}.csv",
-    )
-    if not os.path.exists(result_csv):
-        raise HTTPException(status_code=404, detail="Batch result file not found")
-
-    try:
-        df = pd.read_csv(result_csv)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to read batch result file: {exc}")
-
-    if df.empty:
-        raise HTTPException(status_code=400, detail="Batch result file is empty")
-
-    gene_ids = getattr(ic50_predictor, "_gene_ids", None)
-    if not gene_ids:
-        raise HTTPException(status_code=500, detail="IC50 model gene list not loaded")
-
-    gene_cols = [f"GENE_{int(gene_id)}" for gene_id in gene_ids]
-    missing_cols = [col for col in gene_cols if col not in df.columns]
-    if missing_cols:
-        raise HTTPException(status_code=400, detail=f"Missing gene columns: {missing_cols[:5]}...")
-
-    expression_matrix = df[gene_cols].to_numpy(dtype=np.float64)
-    results = []
-    for idx, row in df.iterrows():
-        smiles = row.get("smiles")
-        time_val = row.get("time")
-        dose_val = row.get("dose")
-        cell_line = request.cellLineId or row.get("cellLineId") or "PC3"
-        context = {
-            "cellLineId": cell_line,
-            "smiles": smiles,
-            "metadata": {
-                "timeHours": float(time_val),
-                "doseUm": float(dose_val),
-            },
-        }
-        prediction = ic50_predictor.predict(expression_matrix[idx], context)
-        results.append({
-            "smiles": str(smiles),
-            "time": float(time_val),
-            "dose": float(dose_val),
-            "cellLineId": str(cell_line),
-            "lnIc50": prediction.get("lnIc50"),
-            "ic50": prediction.get("ic50"),
-            "unit": prediction.get("unit", "uM"),
-            "confidence": prediction.get("confidence"),
-            "toolVersion": prediction.get("toolVersion"),
-            "drugId": prediction.get("drugId"),
-        })
-
-    preview_count = min(request.previewCount, len(results))
-    preview = results[:preview_count]
-
-    try:
-        csv_filename = f"ic50_{file_id}.csv"
-        zip_filename = f"ic50_{file_id}.zip"
-        output_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "batch/results",
-            zip_filename,
-        )
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-        output_df = pd.DataFrame(results)
-        csv_buffer = io.StringIO()
-        output_df.to_csv(csv_buffer, index=False)
-        csv_content = csv_buffer.getvalue()
-
-        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            zipf.writestr(csv_filename, csv_content)
-
-        download_url = f"http://localhost:8080/api/download/{zip_filename}"
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to build IC50 batch output: {exc}")
-
-    return {
-        "success": True,
-        "data": {
-            "processedRows": len(results),
-            "preview": preview,
-            "downloadUrl": download_url,
-        },
-    }
-
-
-@app.post("/api/ic50/sweep/predict")
-async def predict_ic50_sweep(request: SweepIC50Request):
-    start = float(request.range.start)
-    end = float(request.range.end)
-    steps = int(request.range.steps)
-    if steps < 1:
-        raise HTTPException(status_code=400, detail="Sweep steps must be >= 1")
-
-    step_size = (end - start) / (steps - 1) if steps > 1 else 0.0
-    sweep_points = []
-    for i in range(steps):
-        x_value = start + i * step_size
-        if request.sweepVariable == "time":
-            time_val = x_value
-            dose_val = float(request.fixedParamValue)
-        else:
-            time_val = float(request.fixedParamValue)
-            dose_val = x_value
-        sweep_points.append((x_value, time_val, dose_val))
-
-    model = load_onnx_model()
-    ic50_cache: Dict[tuple, Dict[str, Any]] = {}
-    results = []
-    for x_value, time_val, dose_val in sweep_points:
-        cache_key = (request.smiles, request.cellLineId)
-        if cache_key not in ic50_cache:
-            predictions = model.predict_single(
-                request.smiles, float(time_val), float(dose_val), request.cellLineId
-            )
-            vector = expression_to_vector(
-                [{"geneId": gid, "expressionLevel": val} for gid, val in predictions]
-            )
-            context = {
-                "cellLineId": request.cellLineId,
-                "smiles": request.smiles,
-                "metadata": {"timeHours": float(time_val), "doseUm": float(dose_val)},
-            }
-            ic50_cache[cache_key] = ic50_predictor.predict(vector, context)
-
-        prediction = ic50_cache[cache_key]
-        results.append(
-            {
-                "smiles": request.smiles,
-                "time": float(time_val),
-                "dose": float(dose_val),
-                "cellLineId": request.cellLineId,
-                "lnIc50": prediction.get("lnIc50"),
-                "ic50": prediction.get("ic50"),
-                "unit": prediction.get("unit", "uM"),
-                "confidence": prediction.get("confidence"),
-                "toolVersion": prediction.get("toolVersion"),
-                "drugId": prediction.get("drugId"),
-                "xValue": round(float(x_value), 2),
-            }
-        )
-
-    preview_count = min(request.previewCount, len(results))
-    preview = results[:preview_count]
-
-    try:
-        file_id = uuid.uuid4().hex[:8]
-        csv_filename = f"ic50_sweep_{file_id}.csv"
-        zip_filename = f"ic50_sweep_{file_id}.zip"
-        output_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "batch/results",
-            zip_filename,
-        )
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-        output_df = pd.DataFrame(results)
-        csv_buffer = io.StringIO()
-        output_df.to_csv(csv_buffer, index=False)
-        csv_content = csv_buffer.getvalue()
-
-        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            zipf.writestr(csv_filename, csv_content)
-
-        download_url = f"http://localhost:8080/api/download/{zip_filename}"
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to build IC50 sweep output: {exc}")
-
-    return {
-        "success": True,
-        "data": {
-            "processedRows": len(results),
-            "preview": preview,
-            "downloadUrl": download_url,
-        },
-    }
-
-
-# CORS配置
+app = FastAPI(title="Virtual Cell Predictor API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -304,1052 +105,1071 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.mount("/api/metabolomics/results", StaticFiles(directory=str(METAB_RESULTS_DIR)), name="metabolomics_results")
 
-'''
-    函数介绍：选择分析模式
-    入参：
-        AnalysisMode:分析模式
-        data:分析数据
-    出参：
-        anser:预测结果
-''' 
+_onnx_model = None
+_onnx_model_error: Optional[str] = None
+_onnx_model_lock = Lock()
 
-# 根据不同分析模式路由到不同的处理函数
-@app.post("/api/Analysis")
-async def Analysis(request: Dict[str, Any]):
-    
-    AnalysisMode = request.get("AnalysisMode")
-    print(f"AnalysisMode: {AnalysisMode}")
-    if AnalysisMode == 'single':
-        anser = await SingleAnalysis(request)
-    else:
-        BatchMethod = request.get("BatchMethod")
-        if BatchMethod == 'sweep':
-            anser = await BatchSweep(request)
-        else:
-            anser = await BatchUpload(request)
+_batch_result_index: Dict[str, Path] = {}
+_sweep_cache: Dict[str, Dict[str, Any]] = {}
+_download_index: Dict[str, Path] = {}
 
-    return anser
-        
-'''
-    函数介绍：单个分析
-    入参：
-        data:分析数据
-    出参：
-        anser:预测结果
-'''
-# 单个分析接口
-@app.post("/api/Analysis/Single")
-async def SingleAnalysis(request: Dict[str, Any]):
-    success = True
-    start_time = time.time()
-    
-    # 1. 读取数据
-    smiles = request.get("smiles")
-    time1 = request.get("time")
-    dose = request.get("dose")
-    cellLineMode = request.get("cellLineMode")    
-    cellLineId = request.get("cellLineId")
+_metab_tasks: Dict[str, Dict[str, Any]] = {}
+_metab_task_lock = Lock()
 
-    print(f"Single Analysis - smiles: {smiles}, time: {time1}, dose: {dose}, cellLineMode: {cellLineMode}, cellLineId: {cellLineId}")
+_entrez_to_symbol_cache: Optional[Dict[str, str]] = None
+_gmt_cache: Dict[str, Dict[str, set[str]]] = {}
 
-    # 2. 使用模型进行预测
-    model = load_onnx_model()
 
+class RangeConfig(BaseModel):
+    start: float
+    end: float
+    steps: int
+
+
+class BatchSweepRequest(BaseModel):
+    sweepVariable: str
+    range: RangeConfig
+    fixedParamValue: float
+    smiles: str
+    cellLineId: str = "PC3"
+
+
+class ExpressionItem(BaseModel):
+    geneId: str
+    expressionLevel: float
+
+
+class EnrichmentRequest(BaseModel):
+    geneIds: List[str]
+    library: str
+    topN: int = 20
+
+
+class StringNetworkRequest(BaseModel):
+    genes: List[ExpressionItem]
+    minExpression: float = 1.5
+    species: int = 9606
+    requiredScore: int = 400
+    networkType: str = "functional"
+    maxGenes: int = 200
+
+
+class SingleMetabolomicsRequest(BaseModel):
+    expression: List[ExpressionItem]
+    epochs: int = 100
+    imputation: bool = False
+
+
+class KeyGeneRequest(BaseModel):
+    expression: List[ExpressionItem]
+    enrichment: List[Dict[str, Any]] = Field(default_factory=list)
+    ppiGenes: List[str] = Field(default_factory=list)
+    metabolomicsFlux: Dict[str, float] = Field(default_factory=dict)
+    topN: int = 5
+
+
+class BatchSnapshotRequest(BaseModel):
+    smiles: str
+    cellLineId: str
+    sweepVariable: str
+    fixedParamValue: float
+    range: RangeConfig
+    snapshotValue: float
+
+
+def _safe_float(value: Any, default: float) -> float:
     try:
-        if(cellLineMode == "preset"):
-            anser = model.predict_single(smiles, float(time1), float(dose), cellLineId)
-        print(f"✅ ONNX模型预测成功，返回 {len(anser)} 个基因结果")
-    except RuntimeError as e:
-        if "模型尚未加载" in str(e):
-            raise HTTPException(
-                status_code=503,
-                detail="模型尚未加载，无法进行预测。请检查模型加载状态。"
-            )
-        raise
-    
-    # 打印所有预测结果
-    print(f"\n=== 基因表达预测结果 ===")
-    print(f"SMILES: {smiles}")
-    print(f"时间: {time1}h, 剂量: {dose}μM")
-    print(f"{'基因ID':<10} {'表达值':<12} {'状态':<8}")
-    print("-" * 35)
-    for i, (gene_id, expression) in enumerate(anser):
-        if expression > 0:
-            status = "上调"
-        elif expression < 0:
-            status = "下调"
-        else:
-            status = "不变"
-        print(f"{gene_id:<10} {expression:>10.4f} {status:<8}")
-        
-        # 只显示前20个，避免输出过长
-        if i >= 19 and len(anser) > 20:
-            print(f"... 还有 {len(anser) - 20} 个基因结果")
-            break
-    print("=" * 35 + "\n")
+        return float(value)
+    except Exception:
+        return default
 
-    # 3. 返回结果
-    return {
-        'success': success,
-        'data': anser,
-        'metadata': {            
-            'inferenceTime': f"{(time.time() - start_time):.3f}s",
-            'modelVersion': 'xCUDO-final'
-        }
-    }
 
-'''
-    函数介绍：批量分析
-    入参：
-        data:分析数据
-    出参：
-        anser:预测结果
-'''
-# 参数扫描接口
-@app.post("/api/Analysis/Batch/Sweep")
-async def BatchSweep(request: Dict[str, Any]):
-    success = True
-    print(f"完整请求内容: {request}")
+def _sweep_key(payload: Dict[str, Any]) -> str:
+    return json.dumps(payload, sort_keys=True, ensure_ascii=True)
 
-    # 1. 读取数据
-    BatchMethod = "sweep"
-    SweepVariable = request.get("SweepVariable")
-    # 获取范围
-    range_config = request.get('range')
-    
-    # 从范围配置中获取参数
-    start = range_config.get('start')
-    end = range_config.get('end')
-    steps = range_config.get('steps')
-    fixedParamValue = request.get("fixedParamValue")
-    smiles = request.get("smiles")
-    cellLineId = request.get("cellLineId")
-        
-    print(f"Sweep Analysis - smiles: {smiles}, variable: {SweepVariable}, "
-              f"range: {start}-{end}, steps: {steps}"
-              f"fixedParamValue: {fixedParamValue}"
-              f"cellLineId: {cellLineId}")
-    
-    res = []
-    
-    # 生成扫描点
-    step_size = (end - start) / (steps - 1) if steps > 1 else 0
-    
-    for i in range(steps):
-        x_value = start + i * step_size
-        
-        fixed_params = {'time': float(fixedParamValue)}  
-        # 根据扫描变量设置参数
-        if SweepVariable == 'time':
-            current_time = x_value
-            current_dose = float(fixed_params.get('dose', 10))
-        else:            
-            current_time = float(fixed_params.get('time', 24))
-            current_dose = x_value
-         
-        # 进行预测
-        model = load_onnx_model()
 
+def _register_download(path: Path, filename: Optional[str] = None) -> str:
+    name = filename or path.name
+    _download_index[name] = path
+    return f"/api/download/{name}"
+
+
+def _ensure_onnx_model():
+    global _onnx_model, _onnx_model_error
+    if _onnx_model is not None:
+        return _onnx_model
+    with _onnx_model_lock:
+        if _onnx_model is not None:
+            return _onnx_model
+        if load_onnx_model is None:
+            detail = f"ASCEND model import failed: {ONNX_IMPORT_ERROR}"
+            raise HTTPException(status_code=503, detail=detail)
         try:
-            predictions = model.predict_single(smiles, current_time, current_dose, cellLineId)
-            
-            # 转换为扫描格式（只取前5个基因用于显示）
-            genes = {}
-            for gene_id, expression in predictions[:5]:
-                genes[gene_id] = expression
-            
-            res.append({
-                "xValue": round(x_value, 2),
-                "genes": genes
-            })
-            
-            # 打印当前扫描点的详细信息
-            print(f"  扫描点 {i+1}/{steps}: x={x_value:.2f}, time={current_time:.1f}h, dose={current_dose:.1f}μM")
-            print(f"    前5个基因: {[(gid, f'{exp:.3f}') for gid, exp in predictions[:5]]}")
-            
-        except Exception as e:
-            success = False
-            print(f"❌ 扫描点 {x_value} 预测失败: {str(e)}")
-    
-    print(f"✅ 批量扫描完成，生成 {len(res)} 个数据点")
+            _onnx_model = load_onnx_model()
+        except Exception as exc:
+            _onnx_model_error = str(exc)
+            raise HTTPException(status_code=503, detail=f"ASCEND model unavailable: {_onnx_model_error}") from exc
+        return _onnx_model
 
-    # 3. 返回结果
-    anser = {
-        "success": success,
-        "type": 'sweep',
-        "data": res
+
+def _predict_single(smiles: str, time_value: float, dose_value: float, cell_line_id: str) -> List[Tuple[str, float]]:
+    model = _ensure_onnx_model()
+    if hasattr(model, "predict_single"):
+        return model.predict_single(smiles, float(time_value), float(dose_value), cell_line_id)
+    if hasattr(model, "predict"):
+        return model.predict(smiles, float(time_value), float(dose_value), cell_line_id)
+    raise HTTPException(status_code=500, detail="ASCEND model wrapper does not expose predict function.")
+
+
+def _run_sweep(payload: Dict[str, Any]) -> Dict[str, Any]:
+    request = {
+        "sweepVariable": str(payload.get("SweepVariable") or payload.get("sweepVariable") or "dose").lower(),
+        "range": payload.get("range") or {},
+        "fixedParamValue": payload.get("fixedParamValue", 24),
+        "smiles": payload.get("smiles"),
+        "cellLineId": payload.get("cellLineId") or "PC3",
     }
-    return anser
+    start = _safe_float(request["range"].get("start"), 0.0)
+    end = _safe_float(request["range"].get("end"), 100.0)
+    steps = int(request["range"].get("steps", 6))
+    if steps < 2:
+        raise HTTPException(status_code=400, detail="range.steps must be >= 2.")
+    if not request["smiles"]:
+        raise HTTPException(status_code=400, detail="smiles is required.")
+    if request["sweepVariable"] not in {"time", "dose"}:
+        raise HTTPException(status_code=400, detail="sweepVariable must be 'time' or 'dose'.")
 
-# 文件上传接口
-@app.post("/api/analysis/batch/upload")
-async def BatchUpload(file: UploadFile = File(...), cellLineId: Optional[str] = Form(None)):
-    success = True
-    # 1. 读取数据
-    BatchMethod = "upload"
-    # 2.验证文件
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="未选择文件")
-    
-    # 3.检查文件大小
-    file_content = await file.read()
-    max_size = 50 * 1024 * 1024  # MAX 50MB
-    
-    if len(file_content) == 0:
-        raise HTTPException(status_code=400, detail="文件为空")
-    
-    if len(file_content) > max_size:
-        raise HTTPException(status_code=413, detail=f"文件大小超过限制({max_size/1024/1024:.1f}MB)，当前文件大小: {len(file_content)/1024/1024:.1f}MB")
-    
-    # 4.重置文件指针
-    await file.seek(0)
-    
-    # 5.FastAPI中文件上传需要不同的处理方式
-    form = None
-    try:
-        if file.filename.endswith('.csv') :
-            df = pd.read_csv(file.file)
-            form = ".csv"
-        elif file.filename.endswith('.xlsx'):
-            # 对于Excel文件，需要先将内容保存到临时文件
-            import tempfile
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
-                tmp.write(file_content)
-                tmp_path = tmp.name
-            
-            try:
-                df = pd.read_excel(tmp_path)
-                form = ".xlsx"
-            finally:
-                # 清理临时文件
-                os.unlink(tmp_path)
+    fixed_value = request["fixedParamValue"]
+    if isinstance(fixed_value, dict):
+        if request["sweepVariable"] == "dose":
+            fixed_value = fixed_value.get("time", 24)
         else:
-            raise HTTPException(status_code=400, detail="只支持CSV或Excel文件")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"文件读取失败: {str(e)}")
-    
-    # 6.验证文件格式（必须三列）
-    if len(df.columns) != 3:
-        raise HTTPException(status_code=400, detail="文件必须包含恰好三列")
-    
-    # 7.验证列名
-    expected_columns = {'smiles', 'dose', 'time'}
-    if not set(df.columns).issuperset(expected_columns):
-        raise HTTPException(status_code=400, detail=f"文件必须包含列名: {expected_columns}")
-    
-    # 8.预测
-    file_id = str(uuid.uuid4())[:8]
-    file_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),"batch/upload", f"upload_{file_id}{form}")
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
-    with open(file_path, "wb") as f:
-        f.write(file_content)
-    
-    print(f"文件已保存到: {file_path}")
-        
-    model = load_onnx_model()
-    try:
-        pred_df = model.predict_from_file(file_path, file_id, cellLineId)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"预测失败: {str(e)}")
-    
-    try:
-        csv_filename = f"result_{file_id}.csv"
-        zip_filename = f"result_{file_id}.zip"
-        output_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "batch/results", zip_filename)
-            
-        # 确保目录存在
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            
-        # 创建ZIP文件
-        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            # 将DataFrame转换为CSV字符串
-            csv_buffer = io.StringIO()
-            pred_df.to_csv(csv_buffer, index=False)
-            csv_content = csv_buffer.getvalue()
-                
-            # 将CSV内容添加到ZIP文件
-            zipf.writestr(csv_filename, csv_content)
-            
-        # 生成下载URL
-        download_url = f"http://localhost:8080/api/download/{zip_filename}"
-                
-        print(f"✅ ZIP文件已生成: {output_path}")
-        print(f"🔗 下载链接: {download_url}")
-                
-    except Exception as e:
-        print(f"❌ 生成zip文件失败: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"生成结果文件失败: {str(e)}")
-    
-    # 10.构建返回结果
-    result = {
-        'success': success,
-        'type': 'upload',
-        'data': {
-            'processedRows': len(pred_df),
-            'downloadUrl': download_url,
-            'fileId': file_id,
-        }
+            fixed_value = fixed_value.get("dose", 10)
+
+    x_values = np.linspace(start, end, steps)
+    expression_rows: List[Dict[str, float]] = []
+    point_meta: List[Dict[str, float]] = []
+
+    for x in x_values:
+        if request["sweepVariable"] == "dose":
+            time_value = float(fixed_value)
+            dose_value = float(x)
+        else:
+            time_value = float(x)
+            dose_value = float(fixed_value)
+        predicted = _predict_single(request["smiles"], time_value, dose_value, request["cellLineId"])
+        gene_map = {str(gene_id): float(value) for gene_id, value in predicted}
+        expression_rows.append(gene_map)
+        point_meta.append(
+            {
+                "xValue": float(x),
+                "time": float(time_value),
+                "dose": float(dose_value),
+            }
+        )
+
+    matrix = pd.DataFrame(expression_rows, index=[f"point_{i:03d}" for i in range(len(expression_rows))]).fillna(0.0)
+    if matrix.empty:
+        raise HTTPException(status_code=500, detail="Sweep prediction returned empty result.")
+    variability = matrix.var(axis=0).sort_values(ascending=False)
+    top_genes = [str(g) for g in variability.head(5).index.tolist()]
+
+    points = []
+    for i, meta in enumerate(point_meta):
+        values = {g: float(matrix.iloc[i][g]) for g in top_genes}
+        points.append({"xValue": round(meta["xValue"], 6), "genes": values})
+
+    return {
+        "request": request,
+        "points": points,
+        "topGenes": top_genes,
+        "matrix": matrix,
+        "meta": point_meta,
     }
-    
-    # 打印处理结果
-    print(f"\n=== 处理结果 ===")
-    print(f"处理状态: {'成功' if result['success'] else '失败'}")
-    print(f"处理类型: {result['type']}")
-    print(f"处理行数: {result['data']['processedRows']}")
-    print(f"完整返回数据: {result}")
-    print("================\n")
-    
-    return result
 
-# 文件下载接口
-# ?????????????
-# ???????????????
-@app.post("/api/analysis/batch/sweep/export")
-async def export_sweep_for_metabolomics(request: Dict[str, Any]):
-    sweep_variable = request.get("sweepVariable") or request.get("SweepVariable")
-    range_config = request.get("range") or {}
-    start = range_config.get("start")
-    end = range_config.get("end")
-    steps = range_config.get("steps")
-    fixed_param = request.get("fixedParamValue")
-    smiles = request.get("smiles")
-    cell_line = request.get("cellLineId")
 
-    if not smiles or start is None or end is None or steps is None or not sweep_variable:
-        raise HTTPException(status_code=400, detail="Missing sweep parameters")
+def _coerce_numeric_df(df: pd.DataFrame) -> pd.DataFrame:
+    coerced = df.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    return coerced.fillna(0.0)
 
-    steps = int(steps)
-    if steps < 1:
-        raise HTTPException(status_code=400, detail="Sweep steps must be >= 1")
 
-    step_size = (float(end) - float(start)) / (steps - 1) if steps > 1 else 0.0
-    model = load_onnx_model()
+def _extract_gene_columns(df: pd.DataFrame) -> List[str]:
+    return [c for c in df.columns if str(c).startswith("GENE_")]
 
-    rows = []
-    for i in range(steps):
-        x_value = float(start) + i * step_size
-        if sweep_variable == "time":
-            current_time = x_value
-            current_dose = float(fixed_param)
-        else:
-            current_time = float(fixed_param)
-            current_dose = x_value
 
-        predictions = model.predict_single(smiles, current_time, current_dose, cell_line)
-        row = {"cell_id": f"sweep_{i + 1}"}
-        for gene_id, expression in predictions:
-            row[gene_id] = float(expression)
-        rows.append(row)
+def _batch_result_file(file_id: str) -> Path:
+    if file_id in _batch_result_index:
+        return _batch_result_index[file_id]
+    candidate = BATCH_RESULTS_DIR / f"result_{file_id}.csv"
+    if candidate.exists():
+        _batch_result_index[file_id] = candidate
+        return candidate
+    raise HTTPException(status_code=404, detail=f"Batch result file not found for file_id={file_id}.")
 
-    export_df = pd.DataFrame(rows)
-    file_id = uuid.uuid4().hex[:8]
-    export_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "batch/results",
-        f"metabolomics_sweep_{file_id}.csv",
-    )
-    os.makedirs(os.path.dirname(export_path), exist_ok=True)
-    export_df.to_csv(export_path, index=False)
 
-    return FileResponse(
-        path=export_path,
-        filename=f"metabolomics_sweep_{file_id}.csv",
-        media_type="text/csv",
-    )
-@app.get("/api/analysis/batch/export/{file_id}")
-async def export_batch_for_metabolomics(file_id: str):
-    result_csv = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "batch/results",
-        f"result_{file_id}.csv",
-    )
-    if not os.path.exists(result_csv):
-        raise HTTPException(status_code=404, detail="Batch result file not found")
-
-    try:
-        df = pd.read_csv(result_csv)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to read batch result file: {exc}")
-
-    gene_cols = [col for col in df.columns if col.startswith("GENE_")]
+def _summary_pairs_from_matrix(df: pd.DataFrame, top_n: int = 500) -> List[List[Any]]:
+    gene_cols = _extract_gene_columns(df)
     if not gene_cols:
-        raise HTTPException(status_code=400, detail="No gene columns found in batch result")
-
-    export_df = df[gene_cols].copy()
-    export_df.insert(0, "cell_id", [f"cell_{idx + 1}" for idx in range(len(export_df))])
-
-    export_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "batch/results",
-        f"metabolomics_{file_id}.csv",
-    )
-    export_df.to_csv(export_path, index=False)
-
-    return FileResponse(
-        path=export_path,
-        filename=f"metabolomics_{file_id}.csv",
-        media_type="text/csv",
-    )
-@app.get("/api/download/{filename}")
-async def download_file(filename: str):
-    if not filename.endswith(".zip"):
-        raise HTTPException(status_code=400, detail="仅支持 .zip 文件")
-    
-    file_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "batch/results",
-        filename
-    )
-    
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="文件不存在")
-    
-    # 返回文件响应
-    return FileResponse(
-        path=file_path,
-        filename=filename,
-        media_type="application/zip",
-    )
-
-# --- Metabolomics (scFEA) integration ---
-METABO_UPLOAD_DIR = os.path.join(METABO_BACKEND, "upload_files")
-METABO_RESULTS_DIR = os.path.join(METABO_BACKEND, "results")
-METABO_ASSETS_DIR = os.path.join(METABO_BACKEND, "app", "assets")
-
-os.makedirs(METABO_UPLOAD_DIR, exist_ok=True)
-os.makedirs(METABO_RESULTS_DIR, exist_ok=True)
-
-app.mount("/api/metabolomics/results", StaticFiles(directory=METABO_RESULTS_DIR), name="metabolomics-results")
-
-METABO_TASK_STORE = {}
+        return []
+    matrix = _coerce_numeric_df(df[gene_cols])
+    summary = matrix.abs().mean(axis=0).sort_values(ascending=False).head(top_n)
+    return [[str(gene), float(score)] for gene, score in summary.items()]
 
 
-def _ensure_metabolomics_ready():
-    if run_scfea_training is None or run_downstream_analysis is None:
-        detail = "Metabolomics backend not available"
-        if METABO_IMPORT_ERROR:
-            detail = f"{detail}: {METABO_IMPORT_ERROR}"
-        raise HTTPException(status_code=503, detail=detail)
+def _load_entrez_symbol_map() -> Dict[str, str]:
+    global _entrez_to_symbol_cache
+    if _entrez_to_symbol_cache is not None:
+        return _entrez_to_symbol_cache
 
-
-def process_metabolomics_task(job_id: str, input_file_path: str, params: dict):
-    output_dir = os.path.join(METABO_RESULTS_DIR, job_id)
-
-    try:
-        METABO_TASK_STORE[job_id] = {
-            "status": "TRAINING",
-            "progress": 10,
-            "message": "Training scFEA metabolomics model..."
-        }
-
-        epochs = params.get("epochs", 100)
-        use_imputation = params.get("imputation", False)
-        n_clusters = params.get("n_clusters", 4)
-
-        flux_file, balance_file = run_scfea_training(
-            input_file=input_file_path,
-            output_dir=output_dir,
-            assets_dir=METABO_ASSETS_DIR,
-            sc_imputation=use_imputation,
-            epochs=epochs
-        )
-
-        METABO_TASK_STORE[job_id] = {
-            "status": "ANALYZING",
-            "progress": 60,
-            "message": "Running downstream metabolomics analysis..."
-        }
-
-        result_paths = run_downstream_analysis(
-            flux_file=flux_file,
-            balance_file=balance_file,
-            output_dir=output_dir,
-            assets_dir=METABO_ASSETS_DIR,
-            n_clusters=n_clusters
-        )
-
-        METABO_TASK_STORE[job_id] = {
-            "status": "SUCCESS",
-            "progress": 100,
-            "message": "Analysis complete",
-            "result": result_paths
-        }
-
-    except Exception as exc:
-        traceback.print_exc()
-        METABO_TASK_STORE[job_id] = {
-            "status": "FAILURE",
-            "progress": 0,
-            "message": "Analysis failed",
-            "error": str(exc)
-        }
-
-
-@app.post("/api/metabolomics/analyze")
-async def start_metabolomics_analysis(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    epochs: int = Form(100),
-    imputation: bool = Form(False),
-    n_clusters: int = Form(4)
-):
-    _ensure_metabolomics_ready()
-    job_id = str(uuid.uuid4())
-
-    file_ext = os.path.splitext(file.filename)[1]
-    saved_filename = f"{job_id}{file_ext}"
-    file_path = os.path.join(METABO_UPLOAD_DIR, saved_filename)
-
-    try:
-        with open(file_path, "wb+") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"File save failed: {exc}")
-
-    METABO_TASK_STORE[job_id] = {
-        "status": "PENDING",
-        "progress": 0,
-        "message": "Task queued"
-    }
-
-    background_tasks.add_task(
-        process_metabolomics_task,
-        job_id,
-        file_path,
-        {"epochs": epochs, "imputation": imputation, "n_clusters": n_clusters}
-    )
-
-    return {
-        "job_id": job_id,
-        "task_id": job_id,
-        "message": "Metabolomics analysis started"
-    }
-
-
-@app.get("/api/metabolomics/status/{task_id}")
-async def get_metabolomics_status(task_id: str):
-    task_info = METABO_TASK_STORE.get(task_id)
-
-    if not task_info:
-        return {
-            "task_id": task_id,
-            "status": "UNKNOWN",
-            "message": "Task not found"
-        }
-
-    return {
-        "task_id": task_id,
-        "status": task_info["status"],
-        "progress": task_info.get("progress", 0),
-        "message": task_info.get("message", ""),
-        "result": task_info.get("result", None),
-        "error": task_info.get("error", None)
-    }
-
-
-@app.get("/api/metabolomics/diff_plot")
-async def get_metabolomics_diff_plot(job_id: str, c1: int, c2: int):
-    _ensure_metabolomics_ready()
-    output_dir = os.path.join(METABO_RESULTS_DIR, job_id)
-    try:
-        img_name, csv_name = generate_custom_diff_plot(output_dir, c1, c2)
-        return {
-            "status": "success",
-            "image": img_name,
-            "csv": csv_name
-        }
-    except Exception as exc:
-        traceback.print_exc()
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-# --- Gene Enrichment (Enrichr) ---
-ENRICHMENT_API_BASE = "https://maayanlab.cloud/Enrichr"
-ENRICHMENT_LIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "enrichment")
-ENRICHMENT_GO_LIBS = {
-    "GO_Biological_Process_2021": "GO_Biological_Process_2021.gmt",
-    "GO_Molecular_Function_2021": "GO_Molecular_Function_2021.gmt",
-    "GO_Cellular_Component_2021": "GO_Cellular_Component_2021.gmt",
-}
-os.makedirs(ENRICHMENT_LIB_DIR, exist_ok=True)
-
-STRING_API_BASE = "https://string-db.org/api"
-
-
-def _load_entrez_symbol_map(assets_dir: str) -> Dict[str, str]:
-    candidates = [
-        "entrez_to_symbol.csv",
-        "entrez_to_symbol.tsv",
-        "geneid_to_symbol.csv",
-        "geneid_to_symbol.tsv",
-        "geneinfo_beta.txt",
-        "gene_info.txt",
-    ]
-    for name in candidates:
-        path = os.path.join(assets_dir, name)
-        if not os.path.exists(path):
+    mapping: Dict[str, str] = {}
+    for name in ("geneinfo_beta.txt", "gene_info.txt"):
+        path = METAB_ASSETS_DIR / name
+        if not path.exists():
             continue
-        sep = "\t" if name.endswith(".tsv") or name.endswith(".txt") else ","
         try:
-            df = pd.read_csv(path, sep=sep)
+            df = pd.read_csv(path, sep="\t")
         except Exception:
             continue
         if df.empty:
             continue
-        cols = [c.lower() for c in df.columns]
-        if "symbol" not in cols and "gene_symbol" not in cols:
+        cols = {c.lower(): c for c in df.columns}
+        gene_col = cols.get("gene_id") or cols.get("entrez_id") or cols.get("geneid")
+        symbol_col = cols.get("gene_symbol") or cols.get("symbol")
+        if not gene_col or not symbol_col:
             continue
-        entrez_col = None
-        for candidate in ["entrez_id", "gene_id", "geneid", "entrez"]:
-            if candidate in cols:
-                entrez_col = df.columns[cols.index(candidate)]
-                break
-        if entrez_col is None:
-            entrez_col = df.columns[0]
-        symbol_col = df.columns[cols.index("symbol")] if "symbol" in cols else df.columns[cols.index("gene_symbol")]
-        mapping = (
-            df[[entrez_col, symbol_col]]
-            .dropna()
-            .astype(str)
-            .set_index(entrez_col)[symbol_col]
-            .to_dict()
-        )
+        sub = df[[gene_col, symbol_col]].dropna()
+        for _, row in sub.iterrows():
+            entrez = str(row[gene_col]).strip()
+            symbol = str(row[symbol_col]).strip()
+            if entrez and symbol:
+                mapping[entrez] = symbol
         if mapping:
-            return mapping
-    return {}
+            break
+    _entrez_to_symbol_cache = mapping
+    return mapping
 
 
-def _normalize_enrichment_genes(gene_ids: List[str], assets_dir: str):
-    mapping = _load_entrez_symbol_map(assets_dir)
-    symbols: List[str] = []
+def _gene_to_symbol(gene_id: str) -> Optional[str]:
+    gene_id = str(gene_id).strip()
+    if not gene_id:
+        return None
+    mapping = _load_entrez_symbol_map()
+    if gene_id.startswith("GENE_"):
+        entrez = gene_id[5:]
+        return mapping.get(entrez)
+    if gene_id.isdigit():
+        return mapping.get(gene_id)
+    return gene_id
+
+
+def _normalize_gene_ids(gene_ids: Iterable[str]) -> Tuple[List[str], List[str]]:
+    mapped: List[str] = []
     unmapped: List[str] = []
-    for gene in gene_ids:
-        if gene is None:
-            continue
-        raw = str(gene).strip()
-        if not raw:
-            continue
-        key = raw[5:] if raw.startswith("GENE_") else raw
-        symbol = None
-        if mapping:
-            symbol = mapping.get(key)
-        if symbol:
-            symbols.append(symbol)
+    for gene_id in gene_ids:
+        symbol = _gene_to_symbol(gene_id)
+        if symbol is None:
+            unmapped.append(str(gene_id))
         else:
-            if any(ch.isalpha() for ch in key):
-                symbols.append(key)
-            else:
-                unmapped.append(raw)
-    seen = set()
-    unique_symbols = []
-    for sym in symbols:
-        if sym not in seen:
-            seen.add(sym)
-            unique_symbols.append(sym)
-    return unique_symbols, unmapped
+            mapped.append(symbol)
+    uniq = list(dict.fromkeys(mapped))
+    return uniq, unmapped
 
 
-def _map_gene_id_to_symbol(gene_id: str, mapping: Dict[str, str]) -> Optional[str]:
-    if gene_id is None:
-        return None
-    raw = str(gene_id).strip()
-    if not raw:
-        return None
-    key = raw[5:] if raw.startswith("GENE_") else raw
-    symbol = mapping.get(key) if mapping else None
-    if symbol:
-        return symbol
-    if any(ch.isalpha() for ch in key):
-        return key
-    return None
-
-
-def _enrichr_add_list(genes: List[str]) -> str:
-    payload = urlparse.urlencode({
-        "list": "\n".join(genes),
-        "description": "ASCEND transcriptomics enrichment"
-    }).encode("utf-8")
-    req = urlrequest.Request(f"{ENRICHMENT_API_BASE}/addList", data=payload, method="POST")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    with urlrequest.urlopen(req, timeout=20) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    user_list_id = data.get("userListId")
-    if not user_list_id:
-        raise ValueError("Enrichr did not return a userListId")
-    return str(user_list_id)
-
-
-def _enrichr_fetch_results(user_list_id: str, library: str):
-    query = urlparse.urlencode({"userListId": user_list_id, "backgroundType": library})
-    with urlrequest.urlopen(f"{ENRICHMENT_API_BASE}/enrich?{query}", timeout=20) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    return data.get(library, [])
-
-
-def _download_go_library(library: str, dest_path: str):
-    url = f"{ENRICHMENT_API_BASE}/geneSetLibrary?mode=text&libraryName={urlparse.quote(library)}"
-    with urlrequest.urlopen(url, timeout=30) as resp:
-        content = resp.read()
-    with open(dest_path, "wb") as f:
-        f.write(content)
-
-
-def _ensure_go_library(library: str) -> str:
-    filename = ENRICHMENT_GO_LIBS.get(library)
-    if not filename:
-        raise ValueError(f"Offline GO library not supported: {library}")
-    path = os.path.join(ENRICHMENT_LIB_DIR, filename)
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        _download_go_library(library, path)
+def _library_gmt_path(library: str) -> Path:
+    filename = ENRICH_LIBRARY_FILES.get(library)
+    if filename is None:
+        raise HTTPException(status_code=400, detail=f"Unsupported enrichment library: {library}")
+    path = ENRICH_LOCAL_DIR / filename
+    if not path.exists():
+        raise HTTPException(
+            status_code=503,
+            detail=f"Offline GO library file is missing: {path}. Please place the GMT file and retry.",
+        )
     return path
 
 
-@lru_cache(maxsize=8)
-def _load_gmt_library(path: str) -> Dict[str, List[str]]:
-    gene_sets = {}
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+def _load_gmt(path: Path) -> Dict[str, set[str]]:
+    cache_key = str(path.resolve())
+    if cache_key in _gmt_cache:
+        return _gmt_cache[cache_key]
+    terms: Dict[str, set[str]] = {}
+    with path.open("r", encoding="utf-8") as f:
         for line in f:
             parts = line.strip().split("\t")
             if len(parts) < 3:
                 continue
             term = parts[0]
-            genes = [g for g in parts[2:] if g]
+            genes = {g for g in parts[2:] if g}
             if genes:
-                gene_sets[term] = genes
-    if not gene_sets:
-        raise ValueError("GMT library is empty")
-    return gene_sets
+                terms[term] = genes
+    _gmt_cache[cache_key] = terms
+    return terms
 
 
-def _log_comb(n: int, k: int) -> float:
-    if k < 0 or k > n:
-        return float("-inf")
-    return math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)
-
-
-def _logsumexp(log_values: List[float]) -> float:
-    if not log_values:
-        return float("-inf")
-    max_log = max(log_values)
-    if max_log == float("-inf"):
-        return max_log
-    total = sum(math.exp(v - max_log) for v in log_values)
-    return max_log + math.log(total)
-
-
-def _hypergeom_sf(k: int, M: int, n: int, N: int) -> float:
-    # Survival function for hypergeometric: P[X >= k]
-    if k <= 0:
-        return 1.0
-    max_k = min(n, N)
-    if k > max_k:
-        return 0.0
-    log_denom = _log_comb(M, N)
-    log_terms = []
-    for i in range(k, max_k + 1):
-        log_num = _log_comb(n, i) + _log_comb(M - n, N - i)
-        log_terms.append(log_num - log_denom)
-    log_p = _logsumexp(log_terms)
-    if log_p == float("-inf"):
-        return 0.0
-    return min(max(math.exp(log_p), 0.0), 1.0)
-
-
-def _bh_fdr(p_values: List[float]) -> List[float]:
-    n = len(p_values)
-    if n == 0:
+def _bh_adjust(p_values: List[float]) -> List[float]:
+    if not p_values:
         return []
-    order = sorted(range(n), key=lambda i: p_values[i])
-    adj = [0.0] * n
-    prev = 1.0
-    for rank, idx in enumerate(order, start=1):
-        p = p_values[idx]
-        val = min(p * n / rank, 1.0)
-        prev = min(prev, val)
-        adj[idx] = prev
-    # ensure monotonicity
-    for i in range(n - 2, -1, -1):
-        adj[i] = min(adj[i], adj[i + 1])
-    return adj
+    arr = np.asarray(p_values, dtype=float)
+    order = np.argsort(arr)
+    ranked = arr[order]
+    n = float(len(arr))
+    adjusted = np.empty_like(ranked)
+    running = 1.0
+    for i in range(len(ranked) - 1, -1, -1):
+        raw = ranked[i] * n / float(i + 1)
+        running = min(running, raw)
+        adjusted[i] = running
+    out = np.empty_like(adjusted)
+    out[order] = np.clip(adjusted, 0.0, 1.0)
+    return out.tolist()
 
 
-def _run_go_enrichment(genes: List[str], library: str, top_n: int) -> List[Dict[str, Any]]:
-    gmt_path = _ensure_go_library(library)
-    gene_sets = _load_gmt_library(gmt_path)
-    gene_universe = set()
-    for gset in gene_sets.values():
-        gene_universe.update(gset)
-    if not gene_universe:
-        raise ValueError("GO library gene universe is empty")
+def _offline_go_enrichment(gene_ids: List[str], library: str, top_n: int) -> Dict[str, Any]:
+    symbols, unmapped = _normalize_gene_ids(gene_ids)
+    if not symbols:
+        raise HTTPException(status_code=400, detail="No valid genes after symbol normalization.")
 
-    query = [g for g in genes if g in gene_universe]
-    if len(query) < 5:
-        raise ValueError("Not enough mapped genes for GO enrichment after filtering to library")
+    terms = _load_gmt(_library_gmt_path(library))
+    if not terms:
+        raise HTTPException(status_code=500, detail="Offline GO library is empty.")
 
-    M = len(gene_universe)
-    N = len(set(query))
-    results = []
-    for term, gset in gene_sets.items():
-        gs = set(gset)
-        overlap = list(set(query).intersection(gs))
-        k = len(overlap)
-        if k == 0:
+    background = set().union(*terms.values())
+    query = set([g for g in symbols if g in background])
+    if not query:
+        raise HTTPException(
+            status_code=400,
+            detail="No overlap between input genes and offline GO background. Check gene symbols.",
+        )
+
+    total_bg = len(background)
+    total_query = len(query)
+    rows = []
+    p_values: List[float] = []
+    for term, term_genes in terms.items():
+        overlap = query.intersection(term_genes)
+        if not overlap:
             continue
-        n = len(gs)
-        p_val = _hypergeom_sf(k, M, n, N)
-        expected = (N * n) / M
-        combined = -math.log(max(p_val, 1e-300)) * (k / max(expected, 1e-9))
-        results.append({
-            "term": term,
-            "pValue": p_val,
-            "adjP": None,
-            "combinedScore": combined,
-            "genes": overlap
-        })
+        k = len(overlap)
+        n = len(term_genes)
+        if hypergeom is not None:
+            p_value = float(hypergeom.sf(k - 1, total_bg, n, total_query))
+        else:
+            # Conservative fallback when scipy is unavailable.
+            p_value = float(min(1.0, max(1e-300, (n / max(total_bg, 1)) ** k)))
+        p_values.append(p_value)
+        rows.append(
+            {
+                "term": term,
+                "pValue": p_value,
+                "combinedScore": float(-math.log10(p_value + 1e-300) * k),
+                "genes": sorted(overlap),
+            }
+        )
 
-    pvals = [r["pValue"] for r in results]
-    adj = _bh_fdr(pvals)
-    for i, val in enumerate(adj):
-        results[i]["adjP"] = val
+    if not rows:
+        return {"success": True, "library": library, "data": [], "unmapped": unmapped}
 
-    results.sort(key=lambda r: r["adjP"] if r["adjP"] is not None else r["pValue"])
-    return results[:top_n]
+    adjusted = _bh_adjust(p_values)
+    for row, adj in zip(rows, adjusted):
+        row["adjP"] = float(adj)
+    rows.sort(key=lambda x: (x["adjP"], x["pValue"]))
+    return {
+        "success": True,
+        "library": library,
+        "data": rows[: max(1, int(top_n))],
+        "unmapped": unmapped,
+    }
+
+
+def _fallback_ppi_image(genes: List[str]) -> str:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        payload = "PPI graph unavailable"
+        b64 = base64.b64encode(payload.encode("utf-8")).decode("utf-8")
+        return f"data:text/plain;base64,{b64}"
+
+    n = max(1, len(genes))
+    theta = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    x = np.cos(theta)
+    y = np.sin(theta)
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.set_facecolor("#f8fafc")
+    for i in range(n):
+        j = (i + 1) % n
+        ax.plot([x[i], x[j]], [y[i], y[j]], color="#94a3b8", linewidth=1, alpha=0.8)
+    ax.scatter(x, y, s=220, c="#06b6d4", edgecolors="#0f172a", linewidths=0.4)
+    for i, gene in enumerate(genes):
+        ax.text(x[i], y[i], gene, fontsize=8, ha="center", va="center", color="#0f172a")
+    ax.axis("off")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode('utf-8')}"
+
+
+def _string_link(genes: List[str], species: int, required_score: int, network_type: str) -> str:
+    identifiers = "\r".join(genes)
+    encoded = urllib.parse.quote(identifiers, safe="")
+    return (
+        "https://string-db.org/cgi/network?identifiers="
+        f"{encoded}&species={species}&required_score={required_score}&network_type={network_type}"
+    )
+
+
+def _update_metab_task(task_id: str, payload: Dict[str, Any]) -> None:
+    with _metab_task_lock:
+        current = _metab_tasks.get(task_id, {})
+        current.update(payload)
+        _metab_tasks[task_id] = current
+
+
+def _ensure_metabolomics_available() -> None:
+    if run_scfea_training is None or run_downstream_analysis is None:
+        raise HTTPException(status_code=503, detail=f"Metabolomics service unavailable: {METAB_IMPORT_ERROR}")
+
+
+def _process_metabolomics_task(task_id: str, job_id: str, input_file: Path, params: Dict[str, Any]) -> None:
+    try:
+        _update_metab_task(task_id, {"status": "TRAINING", "progress": 10, "message": "Training scFEA model..."})
+        output_dir = METAB_RESULTS_DIR / job_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        flux_file, balance_file = run_scfea_training(
+            input_file=str(input_file),
+            output_dir=str(output_dir),
+            assets_dir=str(METAB_ASSETS_DIR),
+            sc_imputation=bool(params.get("imputation", False)),
+            epochs=int(params.get("epochs", 100)),
+        )
+
+        _update_metab_task(task_id, {"status": "ANALYZING", "progress": 65, "message": "Running downstream analysis..."})
+        analysis = run_downstream_analysis(
+            flux_file=str(flux_file),
+            balance_file=str(balance_file),
+            output_dir=str(output_dir),
+            assets_dir=str(METAB_ASSETS_DIR),
+            n_clusters=int(params.get("n_clusters", 4)),
+        )
+
+        result = {
+            "files": {
+                "flux": str(flux_file),
+                "balance": str(balance_file),
+                **(analysis.get("files", {}) if isinstance(analysis, dict) else {}),
+            },
+            "images": analysis.get("images", {}) if isinstance(analysis, dict) else {},
+        }
+        _update_metab_task(
+            task_id,
+            {
+                "status": "SUCCESS",
+                "progress": 100,
+                "message": "Metabolomics analysis completed.",
+                "result": result,
+            },
+        )
+    except Exception as exc:
+        traceback.print_exc()
+        _update_metab_task(
+            task_id,
+            {
+                "status": "FAILURE",
+                "progress": 0,
+                "message": "Metabolomics analysis failed.",
+                "error": str(exc),
+            },
+        )
+
+
+def _expression_to_single_matrix(expression: List[ExpressionItem], sample_id: str = "sample_000") -> pd.DataFrame:
+    row = {item.geneId: float(item.expressionLevel) for item in expression}
+    df = pd.DataFrame([row], index=[sample_id])
+    return _coerce_numeric_df(df)
+
+
+def _key_gene_scores(payload: KeyGeneRequest) -> List[Dict[str, float]]:
+    if not payload.expression:
+        return []
+    expr_abs = {item.geneId: abs(float(item.expressionLevel)) for item in payload.expression}
+    expr_max = max(expr_abs.values()) if expr_abs else 1.0
+    expr_norm = {gene: (value / expr_max if expr_max else 0.0) for gene, value in expr_abs.items()}
+
+    enrich_weight_by_symbol: Dict[str, float] = {}
+    for term in payload.enrichment:
+        genes = term.get("genes") or []
+        if not isinstance(genes, list):
+            continue
+        p = float(term.get("adjP") or term.get("pValue") or 1.0)
+        weight = max(0.0, -math.log10(p + 1e-300))
+        for gene in genes:
+            key = str(gene)
+            enrich_weight_by_symbol[key] = enrich_weight_by_symbol.get(key, 0.0) + weight
+    enrich_max = max(enrich_weight_by_symbol.values()) if enrich_weight_by_symbol else 1.0
+
+    ppi_symbols = set(_normalize_gene_ids(payload.ppiGenes)[0])
+    flux_values = [abs(float(v)) for v in payload.metabolomicsFlux.values()]
+    flux_strength = float(np.tanh(np.mean(flux_values))) if flux_values else 0.0
+
+    scores: List[Dict[str, float]] = []
+    for item in payload.expression:
+        gene = item.geneId
+        symbol = _gene_to_symbol(gene) or gene
+        expression_score = float(expr_norm.get(gene, 0.0))
+        enrichment_score = float(enrich_weight_by_symbol.get(symbol, 0.0) / enrich_max if enrich_max else 0.0)
+        ppi_score = 1.0 if symbol in ppi_symbols else 0.0
+        metabolomics_score = float(expression_score * flux_strength)
+        final_score = 0.45 * expression_score + 0.25 * enrichment_score + 0.20 * ppi_score + 0.10 * metabolomics_score
+        scores.append(
+            {
+                "gene": gene,
+                "score": float(final_score),
+                "expressionScore": expression_score,
+                "enrichmentScore": enrichment_score,
+                "ppiScore": ppi_score,
+                "metabolomicsScore": metabolomics_score,
+            }
+        )
+    scores.sort(key=lambda x: x["score"], reverse=True)
+    top_n = max(1, int(payload.topN or 5))
+    return scores[:top_n]
+
+
+@app.get("/health")
+def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post("/api/Analysis")
+async def api_analysis(request: Dict[str, Any]) -> Dict[str, Any]:
+    mode = str(request.get("AnalysisMode", "single")).lower()
+    if mode == "single":
+        return await api_analysis_single(request)
+    if mode == "batch":
+        method = str(request.get("BatchMethod", "sweep")).lower()
+        if method == "sweep":
+            return await api_batch_sweep(request)
+        raise HTTPException(status_code=400, detail="Unsupported BatchMethod. Use 'sweep' or upload endpoint.")
+    raise HTTPException(status_code=400, detail="AnalysisMode must be 'single' or 'batch'.")
+
+
+@app.post("/api/Analysis/Single")
+async def api_analysis_single(request: Dict[str, Any]) -> Dict[str, Any]:
+    smiles = request.get("smiles")
+    if not smiles:
+        raise HTTPException(status_code=400, detail="smiles is required.")
+    time_value = _safe_float(request.get("time"), 24.0)
+    dose_value = _safe_float(request.get("dose"), 10.0)
+    cell_line_id = str(request.get("cellLineId") or "PC3")
+
+    start = perf_counter()
+    predicted = _predict_single(smiles=smiles, time_value=time_value, dose_value=dose_value, cell_line_id=cell_line_id)
+    elapsed_ms = int((perf_counter() - start) * 1000.0)
+
+    return {
+        "success": True,
+        "mode": "single",
+        "data": [[str(gene_id), float(value)] for gene_id, value in predicted],
+        "metadata": {
+            "inferenceTime": f"{elapsed_ms} ms",
+            "modelVersion": "ASCEND-ONNX",
+            "smiles": smiles,
+            "time": time_value,
+            "dose": dose_value,
+            "cellLineId": cell_line_id,
+        },
+    }
+
+
+@app.post("/api/Analysis/Batch/Sweep")
+async def api_batch_sweep(request: Dict[str, Any]) -> Dict[str, Any]:
+    cache_key = _sweep_key(
+        {
+            "sweepVariable": str(request.get("SweepVariable") or request.get("sweepVariable") or "dose").lower(),
+            "range": request.get("range") or {},
+            "fixedParamValue": request.get("fixedParamValue"),
+            "smiles": request.get("smiles"),
+            "cellLineId": request.get("cellLineId") or "PC3",
+        }
+    )
+    result = _sweep_cache.get(cache_key)
+    if result is None:
+        result = _run_sweep(request)
+        _sweep_cache[cache_key] = result
+
+    return {
+        "success": True,
+        "type": "sweep",
+        "data": result["points"],
+        "topGenes": result["topGenes"],
+    }
+
+
+@app.post("/api/analysis/batch/upload")
+async def api_batch_upload(file: UploadFile = File(...), cellLineId: Optional[str] = Form(default="PC3")) -> Dict[str, Any]:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file selected.")
+    ext = Path(file.filename).suffix.lower()
+    if ext not in {".csv", ".xlsx", ".xls"}:
+        raise HTTPException(status_code=400, detail="Only CSV/XLS/XLSX files are supported.")
+
+    file_id = uuid.uuid4().hex[:12]
+    saved_input = BATCH_UPLOAD_DIR / f"input_{file_id}{ext}"
+    with saved_input.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    model = _ensure_onnx_model()
+    if not hasattr(model, "predict_from_file"):
+        raise HTTPException(status_code=500, detail="ASCEND model wrapper missing predict_from_file function.")
+
+    try:
+        result_df = model.predict_from_file(str(saved_input), file_id=file_id, cell_id=str(cellLineId or "PC3"))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Batch upload prediction failed: {exc}") from exc
+
+    output_file = BATCH_RESULTS_DIR / f"result_{file_id}.csv"
+    if not output_file.exists():
+        if isinstance(result_df, pd.DataFrame):
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            result_df.to_csv(output_file, index=False)
+        else:
+            raise HTTPException(status_code=500, detail="Batch prediction finished but result file is missing.")
+
+    _batch_result_index[file_id] = output_file
+    download_url = _register_download(output_file)
+    processed_rows = int(result_df.shape[0]) if isinstance(result_df, pd.DataFrame) else 0
+
+    return {
+        "success": True,
+        "type": "upload",
+        "data": {
+            "processedRows": processed_rows,
+            "downloadUrl": download_url,
+            "fileId": file_id,
+        },
+    }
+
+
+@app.get("/api/download/{filename}")
+async def api_download(filename: str) -> FileResponse:
+    path = _download_index.get(filename)
+    if path is None:
+        candidates = [
+            BATCH_RESULTS_DIR / filename,
+            SWEEP_EXPORT_DIR / filename,
+            IC50_EXPORT_DIR / filename,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                path = candidate
+                break
+    if path is None or not path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found: {filename}")
+    return FileResponse(str(path), filename=filename, media_type="application/octet-stream")
+
+
+@app.get("/api/analysis/batch/export/{file_id}")
+async def api_batch_export(file_id: str) -> FileResponse:
+    file_path = _batch_result_file(file_id)
+    return FileResponse(str(file_path), filename=file_path.name, media_type="text/csv")
+
+
+@app.post("/api/analysis/batch/sweep/export")
+async def api_sweep_export(request: Dict[str, Any]) -> FileResponse:
+    cache_key = _sweep_key(
+        {
+            "sweepVariable": str(request.get("sweepVariable") or request.get("SweepVariable") or "dose").lower(),
+            "range": request.get("range") or {},
+            "fixedParamValue": request.get("fixedParamValue"),
+            "smiles": request.get("smiles"),
+            "cellLineId": request.get("cellLineId") or "PC3",
+        }
+    )
+    result = _sweep_cache.get(cache_key)
+    if result is None:
+        result = _run_sweep(request)
+        _sweep_cache[cache_key] = result
+
+    export_name = f"sweep_{uuid.uuid4().hex[:12]}.csv"
+    export_path = SWEEP_EXPORT_DIR / export_name
+    matrix = result["matrix"].copy()
+    matrix.index.name = "cell_id"
+    matrix.to_csv(export_path)
+    _register_download(export_path)
+    return FileResponse(str(export_path), filename=export_name, media_type="text/csv")
+
+
+def _ensure_ic50_predictor():
+    if get_ic50_predictor is None or expression_to_vector is None:
+        raise HTTPException(status_code=503, detail=f"IC50 service unavailable: {IC50_IMPORT_ERROR}")
+    try:
+        return get_ic50_predictor()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"IC50 model failed to initialize: {exc}") from exc
+
+
+@app.post("/api/ic50/predict")
+async def api_ic50_predict(request: Dict[str, Any]) -> Dict[str, Any]:
+    expression = request.get("expression") or []
+    if not isinstance(expression, list) or len(expression) == 0:
+        raise HTTPException(status_code=400, detail="expression is required.")
+
+    predictor = _ensure_ic50_predictor()
+    try:
+        vector = expression_to_vector(expression)
+        context = {
+            "smiles": request.get("smiles"),
+            "cellLineId": request.get("cellLineId"),
+            "metadata": request.get("metadata") or {},
+        }
+        pred = predictor.predict(vector, context)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"IC50 prediction failed: {exc}") from exc
+    return {"success": True, "data": pred}
+
+
+@app.post("/api/ic50/batch/predict")
+async def api_ic50_batch_predict(request: Dict[str, Any]) -> Dict[str, Any]:
+    file_id = str(request.get("fileId") or "").strip()
+    if not file_id:
+        raise HTTPException(status_code=400, detail="fileId is required.")
+    preview_count = int(request.get("previewCount") or 10)
+    predictor = _ensure_ic50_predictor()
+
+    df = pd.read_csv(_batch_result_file(file_id))
+    gene_cols = _extract_gene_columns(df)
+    if not gene_cols:
+        raise HTTPException(status_code=400, detail="No GENE_* columns found in uploaded batch file.")
+
+    records: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        expression = [{"geneId": g, "expressionLevel": float(row[g])} for g in gene_cols]
+        context = {
+            "smiles": row.get("smiles"),
+            "cellLineId": row.get("cellLineId") or row.get("cellLine") or request.get("cellLineId") or "PC3",
+            "metadata": {
+                "timeHours": float(row.get("time", 24)),
+                "doseUm": float(row.get("dose", 10)),
+            },
+        }
+        try:
+            pred = predictor.predict(expression_to_vector(expression), context)
+            records.append(
+                {
+                    "smiles": context["smiles"],
+                    "time": context["metadata"]["timeHours"],
+                    "dose": context["metadata"]["doseUm"],
+                    "cellLineId": context["cellLineId"],
+                    **pred,
+                }
+            )
+        except Exception as exc:
+            LOGGER.warning("IC50 batch row failed: %s", exc)
+
+    out_df = pd.DataFrame(records)
+    out_path = IC50_EXPORT_DIR / f"ic50_batch_{file_id}_{uuid.uuid4().hex[:8]}.csv"
+    out_df.to_csv(out_path, index=False)
+    download_url = _register_download(out_path)
+
+    return {
+        "success": True,
+        "data": {
+            "processedRows": int(len(records)),
+            "preview": records[: max(1, preview_count)],
+            "downloadUrl": download_url,
+        },
+    }
+
+
+@app.post("/api/ic50/sweep/predict")
+async def api_ic50_sweep_predict(request: Dict[str, Any]) -> Dict[str, Any]:
+    preview_count = int(request.get("previewCount") or 10)
+    predictor = _ensure_ic50_predictor()
+
+    sweep_result = _run_sweep(
+        {
+            "sweepVariable": request.get("sweepVariable"),
+            "range": request.get("range"),
+            "fixedParamValue": request.get("fixedParamValue"),
+            "smiles": request.get("smiles"),
+            "cellLineId": request.get("cellLineId"),
+        }
+    )
+    matrix = sweep_result["matrix"]
+    meta = sweep_result["meta"]
+    gene_cols = [str(c) for c in matrix.columns]
+
+    records: List[Dict[str, Any]] = []
+    for i in range(matrix.shape[0]):
+        row = matrix.iloc[i]
+        expression = [{"geneId": g, "expressionLevel": float(row[g])} for g in gene_cols]
+        context = {
+            "smiles": request.get("smiles"),
+            "cellLineId": request.get("cellLineId") or "PC3",
+            "metadata": {
+                "timeHours": float(meta[i]["time"]),
+                "doseUm": float(meta[i]["dose"]),
+            },
+        }
+        try:
+            pred = predictor.predict(expression_to_vector(expression), context)
+            records.append(
+                {
+                    "smiles": context["smiles"],
+                    "time": context["metadata"]["timeHours"],
+                    "dose": context["metadata"]["doseUm"],
+                    "cellLineId": context["cellLineId"],
+                    **pred,
+                }
+            )
+        except Exception as exc:
+            LOGGER.warning("IC50 sweep point failed: %s", exc)
+
+    out_df = pd.DataFrame(records)
+    out_path = IC50_EXPORT_DIR / f"ic50_sweep_{uuid.uuid4().hex[:12]}.csv"
+    out_df.to_csv(out_path, index=False)
+    download_url = _register_download(out_path)
+
+    return {
+        "success": True,
+        "data": {
+            "processedRows": int(len(records)),
+            "preview": records[: max(1, preview_count)],
+            "downloadUrl": download_url,
+        },
+    }
+
+
+@app.post("/api/metabolomics/analyze")
+async def api_metabolomics_analyze(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    epochs: int = Form(100),
+    imputation: bool = Form(False),
+    n_clusters: int = Form(4),
+) -> Dict[str, Any]:
+    _ensure_metabolomics_available()
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file selected.")
+    ext = Path(file.filename).suffix.lower() or ".csv"
+    job_id = uuid.uuid4().hex
+    task_id = job_id
+    saved_file = METAB_UPLOAD_DIR / f"{job_id}{ext}"
+    with saved_file.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    _update_metab_task(
+        task_id,
+        {
+            "task_id": task_id,
+            "status": "PENDING",
+            "progress": 0,
+            "message": "Task submitted.",
+        },
+    )
+    background_tasks.add_task(
+        _process_metabolomics_task,
+        task_id,
+        job_id,
+        saved_file,
+        {"epochs": epochs, "imputation": imputation, "n_clusters": n_clusters},
+    )
+    return {"job_id": job_id, "task_id": task_id, "message": "Metabolomics analysis started."}
+
+
+@app.get("/api/metabolomics/status/{task_id}")
+async def api_metabolomics_status(task_id: str) -> Dict[str, Any]:
+    task = _metab_tasks.get(task_id)
+    if task is None:
+        return {
+            "task_id": task_id,
+            "status": "UNKNOWN",
+            "progress": 0,
+            "message": "Task not found.",
+        }
+    return {
+        "task_id": task_id,
+        "status": task.get("status", "UNKNOWN"),
+        "progress": int(task.get("progress", 0)),
+        "message": task.get("message", ""),
+        "result": task.get("result"),
+        "error": task.get("error"),
+    }
+
+
+@app.get("/api/metabolomics/diff_plot")
+async def api_metabolomics_diff_plot(job_id: str, c1: int = 0, c2: int = 1) -> Dict[str, Any]:
+    if generate_custom_diff_plot is None:
+        raise HTTPException(status_code=503, detail=f"Diff-plot service unavailable: {METAB_IMPORT_ERROR}")
+    output_dir = METAB_RESULTS_DIR / job_id
+    if not output_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+    try:
+        img_name, csv_name = generate_custom_diff_plot(str(output_dir), int(c1), int(c2))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "success", "image": img_name, "csv": csv_name}
 
 
 @app.post("/api/enrichment/run")
-async def run_gene_enrichment(request: EnrichmentRequest):
-    if not request.geneIds:
-        raise HTTPException(status_code=400, detail="geneIds is required")
-
-    genes, unmapped = _normalize_enrichment_genes(request.geneIds, METABO_ASSETS_DIR)
-    if len(genes) < 5:
-        raise HTTPException(
-            status_code=400,
-            detail="Not enough mapped genes for enrichment. Check gene ID mapping."
-        )
-
-    results = []
-    if request.library in ENRICHMENT_GO_LIBS:
-        try:
-            results = _run_go_enrichment(genes, request.library, request.topN)
-        except urlerror.URLError as exc:
-            raise HTTPException(status_code=503, detail=f"GO library download failed: {exc}")
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Offline GO enrichment failed: {exc}")
-    else:
-        try:
-            user_list_id = _enrichr_add_list(genes)
-            raw_results = _enrichr_fetch_results(user_list_id, request.library)
-        except urlerror.URLError as exc:
-            raise HTTPException(status_code=503, detail=f"Enrichment service unavailable: {exc}")
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Enrichment failed: {exc}")
-
-        for row in raw_results:
-            if not row or len(row) < 6:
-                continue
-            term = row[1]
-            p_value = float(row[2]) if row[2] is not None else 1.0
-            combined_score = float(row[4]) if len(row) > 4 and row[4] is not None else None
-            overlap_genes = row[5] if len(row) > 5 else ""
-            adj_p = float(row[6]) if len(row) > 6 and row[6] is not None else None
-            gene_list = [g for g in str(overlap_genes).replace(";", ",").split(",") if g]
-            results.append({
-                "term": term,
-                "pValue": p_value,
-                "adjP": adj_p,
-                "combinedScore": combined_score,
-                "genes": gene_list
-            })
-
-        results = results[:request.topN]
-    return {
-        "success": True,
-        "library": request.library,
-        "data": results,
-        "unmapped": unmapped
-    }
-
-
-def _get_gene_columns(df: pd.DataFrame) -> List[str]:
-    gene_cols = [col for col in df.columns if str(col).startswith("GENE_")]
-    if gene_cols:
-        return gene_cols
-    meta_cols = {"smiles", "time", "dose", "cellLineId", "cell_id"}
-    candidate_cols = [col for col in df.columns if str(col) not in meta_cols]
-    numeric_cols = []
-    for col in candidate_cols:
-        series = pd.to_numeric(df[col], errors="coerce")
-        if series.notna().any():
-            numeric_cols.append(col)
-    return numeric_cols
-
-
-def _summarize_gene_matrix(df: pd.DataFrame) -> List[List[Union[str, float]]]:
-    gene_cols = _get_gene_columns(df)
-    if not gene_cols:
-        raise ValueError("No gene columns found in batch result")
-    gene_df = df[gene_cols].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0)
-    means = gene_df.mean(axis=0)
-    return [[str(gene_id), float(means[gene_id])] for gene_id in gene_cols]
-
-
-@app.get("/api/enrichment/batch/summary/{file_id}")
-async def get_batch_enrichment_summary(file_id: str):
-    result_csv = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "batch/results",
-        f"result_{file_id}.csv",
-    )
-    if not os.path.exists(result_csv):
-        raise HTTPException(status_code=404, detail="Batch result file not found")
-    try:
-        df = pd.read_csv(result_csv)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to read batch result file: {exc}")
-    if df.empty:
-        raise HTTPException(status_code=400, detail="Batch result file is empty")
-    try:
-        data = _summarize_gene_matrix(df)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return {
-        "success": True,
-        "data": data,
-        "processedRows": len(df)
-    }
-
-
-@app.post("/api/enrichment/sweep/summary")
-async def get_sweep_enrichment_summary(request: Dict[str, Any]):
-    sweep_variable = request.get("sweepVariable") or request.get("SweepVariable")
-    range_config = request.get("range") or {}
-    start = range_config.get("start")
-    end = range_config.get("end")
-    steps = range_config.get("steps")
-    fixed_param = request.get("fixedParamValue")
-    smiles = request.get("smiles")
-    cell_line = request.get("cellLineId")
-
-    if not smiles or start is None or end is None or steps is None or not sweep_variable:
-        raise HTTPException(status_code=400, detail="Missing sweep parameters")
-
-    steps = int(steps)
-    if steps < 1:
-        raise HTTPException(status_code=400, detail="Sweep steps must be >= 1")
-
-    step_size = (float(end) - float(start)) / (steps - 1) if steps > 1 else 0.0
-    model = load_onnx_model()
-
-    rows = []
-    for i in range(steps):
-        x_value = float(start) + i * step_size
-        if sweep_variable == "time":
-            current_time = x_value
-            current_dose = float(fixed_param)
-        else:
-            current_time = float(fixed_param)
-            current_dose = x_value
-
-        predictions = model.predict_single(smiles, current_time, current_dose, cell_line)
-        row = {"cell_id": f"sweep_{i + 1}"}
-        for gene_id, expression in predictions:
-            row[gene_id] = float(expression)
-        rows.append(row)
-
-    df = pd.DataFrame(rows)
-    try:
-        data = _summarize_gene_matrix(df)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return {
-        "success": True,
-        "data": data,
-        "processedRows": len(df)
-    }
+async def api_enrichment_run(request: EnrichmentRequest) -> Dict[str, Any]:
+    return _offline_go_enrichment(request.geneIds, request.library, request.topN)
 
 
 @app.post("/api/enrichment/string_network")
-async def get_string_network(request: StringNetworkRequest):
-    if not request.genes:
-        raise HTTPException(status_code=400, detail="genes is required")
-
-    mapping = _load_entrez_symbol_map(METABO_ASSETS_DIR)
-    filtered = [g for g in request.genes if g.expressionLevel is not None and g.expressionLevel > request.minExpression]
+async def api_string_network(request: StringNetworkRequest) -> Dict[str, Any]:
+    filtered = [g for g in request.genes if float(g.expressionLevel) > float(request.minExpression)]
     if not filtered:
-        raise HTTPException(status_code=400, detail="No genes passed the expression filter")
-
-    filtered.sort(key=lambda g: g.expressionLevel, reverse=True)
-    filtered = filtered[: request.maxGenes]
-    symbols = []
-    for item in filtered:
-        sym = _map_gene_id_to_symbol(item.geneId, mapping)
-        if sym:
-            symbols.append(sym)
+        raise HTTPException(status_code=400, detail="No genes pass the expression threshold.")
+    filtered.sort(key=lambda x: x.expressionLevel, reverse=True)
+    selected = filtered[: max(1, int(request.maxGenes))]
+    symbols, _ = _normalize_gene_ids([g.geneId for g in selected])
     if not symbols:
-        raise HTTPException(status_code=400, detail="No valid gene symbols found after mapping")
-
-    identifiers = "\r".join(symbols)
-    payload = urlparse.urlencode({
-        "identifiers": identifiers,
-        "species": str(request.species),
-        "required_score": str(request.requiredScore),
-        "network_type": request.networkType,
-        "caller_identity": "virtual-cell-ai",
-    }).encode("utf-8")
-
-    try:
-        svg_url = f"{STRING_API_BASE}/svg/network"
-        req = urlrequest.Request(svg_url, data=payload, method="POST")
-        req.add_header("Content-Type", "application/x-www-form-urlencoded")
-        with urlrequest.urlopen(req, timeout=30) as resp:
-            svg_data = resp.read()
-
-        link_url = f"{STRING_API_BASE}/tsv/get_link"
-        link_req = urlrequest.Request(link_url, data=payload, method="POST")
-        link_req.add_header("Content-Type", "application/x-www-form-urlencoded")
-        link = None
-        with urlrequest.urlopen(link_req, timeout=30) as resp:
-            text = resp.read().decode("utf-8", errors="ignore").strip()
-            if text:
-                # Skip header if present
-                lines = [line for line in text.splitlines() if line.strip()]
-                if len(lines) > 1:
-                    parts = lines[1].split("\t")
-                    if parts:
-                        link = parts[0]
-
-        image_b64 = base64.b64encode(svg_data).decode("utf-8")
-        image_uri = f"data:image/svg+xml;base64,{image_b64}"
-
-    except urlerror.HTTPError as exc:
-        raise HTTPException(status_code=503, detail=f"STRING API error: {exc}")
-    except urlerror.URLError as exc:
-        raise HTTPException(status_code=503, detail=f"STRING API unavailable: {exc}")
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"STRING network failed: {exc}")
-
+        raise HTTPException(status_code=400, detail="No genes can be mapped to symbols for STRING query.")
+    # Data URI image keeps this endpoint working offline and avoids API-rate issues.
+    image = _fallback_ppi_image(symbols[: min(40, len(symbols))])
+    link = _string_link(symbols[: min(200, len(symbols))], request.species, request.requiredScore, request.networkType)
     return {
         "success": True,
         "filteredCount": len(filtered),
         "mappedCount": len(symbols),
-        "image": image_uri,
-        "link": link
+        "genesUsed": symbols,
+        "image": image,
+        "link": link,
     }
 
-if __name__ == "__main__":
-    print("Loading xCUDO ONNX model and FastAPI starting server ...")
-    print("Please wait until server has fully started")
-    print("Server will be available at: http://localhost:8080")
-    print("Frontend can connect from: http://localhost:3000")
-    
-    # 加载ONNX模型
+
+@app.get("/api/enrichment/batch/summary/{file_id}")
+async def api_enrichment_batch_summary(file_id: str) -> Dict[str, Any]:
+    df = pd.read_csv(_batch_result_file(file_id))
+    return {"success": True, "data": _summary_pairs_from_matrix(df)}
+
+
+@app.post("/api/enrichment/sweep/summary")
+async def api_enrichment_sweep_summary(request: Dict[str, Any]) -> Dict[str, Any]:
+    result = _run_sweep(
+        {
+            "sweepVariable": request.get("sweepVariable"),
+            "range": request.get("range"),
+            "fixedParamValue": request.get("fixedParamValue"),
+            "smiles": request.get("smiles"),
+            "cellLineId": request.get("cellLineId"),
+        }
+    )
+    return {"success": True, "data": _summary_pairs_from_matrix(result["matrix"])}
+
+
+@app.post("/api/workflow/single/metabolomics")
+async def api_workflow_single_metabolomics(request: SingleMetabolomicsRequest) -> Dict[str, Any]:
+    _ensure_metabolomics_available()
+    if not request.expression:
+        raise HTTPException(status_code=400, detail="expression is required.")
+
+    job_id = f"single_{uuid.uuid4().hex[:12]}"
+    output_dir = METAB_RESULTS_DIR / job_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+    input_file = METAB_UPLOAD_DIR / f"{job_id}.csv"
+
+    expression_df = _expression_to_single_matrix(request.expression, sample_id="single_0")
+    expression_df.to_csv(input_file, index=True)
+
     try:
-        load_onnx_model()
-        print("✅ xCUDO ONNX model loaded successfully!")
-    except Exception as e:
-        print(f"❌ Failed to load xCUDO ONNX model: {str(e)}")
-    
-    # 启动服务器
-    uvicorn.run(app, host="0.0.0.0", port=8080, reload=False)
+        flux_file, balance_file = run_scfea_training(
+            input_file=str(input_file),
+            output_dir=str(output_dir),
+            assets_dir=str(METAB_ASSETS_DIR),
+            sc_imputation=bool(request.imputation),
+            epochs=int(request.epochs),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Single metabolomics workflow failed: {exc}") from exc
+
+    flux_df = pd.read_csv(flux_file, index_col=0)
+    balance_df = pd.read_csv(balance_file, index_col=0)
+    flux = {str(k): float(v) for k, v in flux_df.iloc[0].to_dict().items()}
+    balance = {str(k): float(v) for k, v in balance_df.iloc[0].to_dict().items()}
+    return {
+        "success": True,
+        "jobId": job_id,
+        "flux": flux,
+        "balance": balance,
+        "files": {
+            "flux": f"/api/metabolomics/results/{job_id}/{Path(flux_file).name}",
+            "balance": f"/api/metabolomics/results/{job_id}/{Path(balance_file).name}",
+        },
+    }
+
+
+@app.post("/api/workflow/single/key_genes")
+async def api_workflow_single_key_genes(request: KeyGeneRequest) -> Dict[str, Any]:
+    return {"success": True, "topGenes": _key_gene_scores(request)}
+
+
+@app.post("/api/workflow/batch/snapshot")
+async def api_workflow_batch_snapshot(request: BatchSnapshotRequest) -> Dict[str, Any]:
+    payload = {
+        "sweepVariable": request.sweepVariable,
+        "range": {"start": request.range.start, "end": request.range.end, "steps": request.range.steps},
+        "fixedParamValue": request.fixedParamValue,
+        "smiles": request.smiles,
+        "cellLineId": request.cellLineId,
+    }
+    result = _run_sweep(payload)
+    meta = result["meta"]
+    matrix = result["matrix"]
+    x = np.asarray([float(m["xValue"]) for m in meta], dtype=float)
+    idx = int(np.abs(x - float(request.snapshotValue)).argmin())
+    row = matrix.iloc[idx]
+    expression = [{"geneId": str(g), "expressionLevel": float(v)} for g, v in row.to_dict().items()]
+    cell_id = str(matrix.index[idx])
+    return {
+        "success": True,
+        "pointIndex": idx,
+        "cellId": cell_id,
+        "xValue": float(meta[idx]["xValue"]),
+        "time": float(meta[idx]["time"]),
+        "dose": float(meta[idx]["dose"]),
+        "expression": expression,
+    }
+
+
+@app.get("/api/workflow/batch/metabolomics_snapshot")
+async def api_workflow_batch_metabolomics_snapshot(job_id: str = Query(...), point_index: int = Query(...)) -> Dict[str, Any]:
+    flux_file = METAB_RESULTS_DIR / job_id / "predicted_flux.csv"
+    if not flux_file.exists():
+        raise HTTPException(status_code=404, detail=f"Metabolomics result not found for job_id={job_id}.")
+    flux_df = pd.read_csv(flux_file, index_col=0)
+    if point_index < 0 or point_index >= flux_df.shape[0]:
+        raise HTTPException(status_code=400, detail="point_index out of range.")
+    row = flux_df.iloc[int(point_index)]
+    return {
+        "success": True,
+        "cellId": str(flux_df.index[int(point_index)]),
+        "flux": {str(k): float(v) for k, v in row.to_dict().items()},
+    }
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    if load_onnx_model is None:
+        LOGGER.warning("ASCEND model import unavailable: %s", ONNX_IMPORT_ERROR)
+        return
+    try:
+        _ensure_onnx_model()
+        LOGGER.info("ASCEND model loaded.")
+    except Exception as exc:
+        LOGGER.warning("ASCEND model not loaded at startup: %s", exc)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)
