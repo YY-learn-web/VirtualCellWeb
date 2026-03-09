@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import csv
 import io
 import json
 import logging
@@ -53,6 +54,7 @@ ENRICH_LIBRARY_FILES = {
     "GO_Molecular_Function_2021": "GO_Molecular_Function_2021.gmt",
     "GO_Cellular_Component_2021": "GO_Cellular_Component_2021.gmt",
 }
+STRING_API_BASE = "https://string-db.org/api"
 
 for folder in (
     BATCH_UPLOAD_DIR,
@@ -483,7 +485,94 @@ def _offline_go_enrichment(gene_ids: List[str], library: str, top_n: int) -> Dic
     }
 
 
-def _fallback_ppi_image(genes: List[str]) -> str:
+def _fetch_string_api_bytes(
+    output_format: str,
+    method: str,
+    endpoint: str,
+    params: Dict[str, Any],
+    timeout: float = 20.0,
+) -> bytes:
+    encoded_params = urllib.parse.urlencode(
+        {k: v for k, v in params.items() if v is not None},
+        doseq=True,
+    ).encode("utf-8")
+    url = f"{STRING_API_BASE}/{output_format}/{endpoint}"
+    if method.upper() == "GET":
+        url = f"{url}?{encoded_params.decode('utf-8')}"
+        request = urllib.request.Request(url, method="GET")
+    else:
+        request = urllib.request.Request(url, data=encoded_params, method="POST")
+        request.add_header("Content-Type", "application/x-www-form-urlencoded")
+
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+def _fetch_string_network_image(
+    genes: List[str],
+    species: int,
+    required_score: int,
+    network_type: str,
+) -> str:
+    image_bytes = _fetch_string_api_bytes(
+        output_format="image",
+        method="POST",
+        endpoint="network",
+        params={
+            "identifiers": "\r".join(genes),
+            "species": species,
+            "required_score": required_score,
+            "network_type": network_type,
+            "caller_identity": "virtual-cell-ai",
+        },
+    )
+    return f"data:image/png;base64,{base64.b64encode(image_bytes).decode('utf-8')}"
+
+
+def _fetch_string_interactions(
+    genes: List[str],
+    species: int,
+    required_score: int,
+    network_type: str,
+) -> List[Dict[str, Any]]:
+    raw = _fetch_string_api_bytes(
+        output_format="tsv",
+        method="POST",
+        endpoint="network",
+        params={
+            "identifiers": "\r".join(genes),
+            "species": species,
+            "required_score": required_score,
+            "network_type": network_type,
+            "caller_identity": "virtual-cell-ai",
+        },
+    )
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text:
+        return []
+
+    rows = list(csv.DictReader(io.StringIO(text), delimiter="\t"))
+    interactions: List[Dict[str, Any]] = []
+    for row in rows:
+        gene_a = row.get("preferredName_A") or row.get("stringId_A") or row.get("protein1")
+        gene_b = row.get("preferredName_B") or row.get("stringId_B") or row.get("protein2")
+        if not gene_a or not gene_b:
+            continue
+        try:
+            score = float(row.get("score", 0.0))
+        except Exception:
+            score = 0.0
+        interactions.append(
+            {
+                "geneA": str(gene_a),
+                "geneB": str(gene_b),
+                "score": score,
+            }
+        )
+    return interactions
+
+
+def _render_ppi_interaction_image(genes: List[str], interactions: List[Dict[str, Any]]) -> str:
     try:
         import matplotlib
 
@@ -494,18 +583,32 @@ def _fallback_ppi_image(genes: List[str]) -> str:
         b64 = base64.b64encode(payload.encode("utf-8")).decode("utf-8")
         return f"data:text/plain;base64,{b64}"
 
-    n = max(1, len(genes))
+    unique_genes = list(dict.fromkeys(genes))
+    n = max(1, len(unique_genes))
     theta = np.linspace(0, 2 * np.pi, n, endpoint=False)
-    x = np.cos(theta)
-    y = np.sin(theta)
-    fig, ax = plt.subplots(figsize=(6, 6))
+    radius = 1.0 + 0.15 * np.sin(theta * 3)
+    x = radius * np.cos(theta)
+    y = radius * np.sin(theta)
+    positions = {gene: (x[idx], y[idx]) for idx, gene in enumerate(unique_genes)}
+
+    fig, ax = plt.subplots(figsize=(7, 7))
     ax.set_facecolor("#f8fafc")
-    for i in range(n):
-        j = (i + 1) % n
-        ax.plot([x[i], x[j]], [y[i], y[j]], color="#94a3b8", linewidth=1, alpha=0.8)
-    ax.scatter(x, y, s=220, c="#06b6d4", edgecolors="#0f172a", linewidths=0.4)
-    for i, gene in enumerate(genes):
-        ax.text(x[i], y[i], gene, fontsize=8, ha="center", va="center", color="#0f172a")
+
+    for edge in interactions:
+        gene_a = edge["geneA"]
+        gene_b = edge["geneB"]
+        if gene_a not in positions or gene_b not in positions:
+            continue
+        xa, ya = positions[gene_a]
+        xb, yb = positions[gene_b]
+        score = float(edge.get("score", 0.0))
+        linewidth = 0.8 + 2.2 * max(0.0, min(score, 1.0))
+        alpha = 0.25 + 0.55 * max(0.0, min(score, 1.0))
+        ax.plot([xa, xb], [ya, yb], color="#2563eb", linewidth=linewidth, alpha=alpha, zorder=1)
+
+    ax.scatter(x, y, s=280, c="#06b6d4", edgecolors="#0f172a", linewidths=0.8, zorder=2)
+    for gene, (gx, gy) in positions.items():
+        ax.text(gx, gy, gene, fontsize=8, ha="center", va="center", color="#0f172a", zorder=3)
     ax.axis("off")
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
@@ -1034,9 +1137,41 @@ async def api_string_network(request: StringNetworkRequest) -> Dict[str, Any]:
     symbols, _ = _normalize_gene_ids([g.geneId for g in selected])
     if not symbols:
         raise HTTPException(status_code=400, detail="No genes can be mapped to symbols for STRING query.")
-    # Data URI image keeps this endpoint working offline and avoids API-rate issues.
-    image = _fallback_ppi_image(symbols[: min(40, len(symbols))])
-    link = _string_link(symbols[: min(200, len(symbols))], request.species, request.requiredScore, request.networkType)
+
+    display_genes = symbols[: min(40, len(symbols))]
+    link_genes = symbols[: min(200, len(symbols))]
+    interactions: List[Dict[str, Any]] = []
+    image: Optional[str] = None
+
+    try:
+        interactions = _fetch_string_interactions(
+            genes=display_genes,
+            species=request.species,
+            required_score=request.requiredScore,
+            network_type=request.networkType,
+        )
+        if not interactions:
+            raise HTTPException(status_code=404, detail="STRING returned no protein-protein interactions.")
+
+        try:
+            image = _fetch_string_network_image(
+                genes=display_genes,
+                species=request.species,
+                required_score=request.requiredScore,
+                network_type=request.networkType,
+            )
+        except Exception:
+            # If STRING image rendering is unavailable, render the returned interaction edges locally.
+            image = _render_ppi_interaction_image(display_genes, interactions)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"STRING protein interaction network unavailable: {exc}") from exc
+
+    if not image:
+        raise HTTPException(status_code=503, detail="STRING protein interaction image unavailable.")
+
+    link = _string_link(link_genes, request.species, request.requiredScore, request.networkType)
     return {
         "success": True,
         "filteredCount": len(filtered),

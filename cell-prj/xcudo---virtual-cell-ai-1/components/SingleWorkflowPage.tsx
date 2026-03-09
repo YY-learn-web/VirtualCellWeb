@@ -320,11 +320,11 @@ export const SingleWorkflowPage: React.FC<SingleWorkflowPageProps> = ({ isDark }
               </p>
               {ppi.link ? (
                 <a href={ppi.link} target="_blank" rel="noreferrer" className="text-xs text-cyan-600 dark:text-cyan-400 underline">
-                  Open interactive STRING view
+                  Open interactive STRING PPI view
                 </a>
               ) : null}
               <div className="w-full overflow-x-auto rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/40 p-2">
-                <img src={ppi.image} alt="STRING network" className="w-full h-auto" />
+                <img src={ppi.image} alt="Protein-protein interaction network" className="w-full h-auto" />
               </div>
             </div>
           ) : null}

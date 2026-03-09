@@ -22,5 +22,6 @@ cell-prj/webData/CLUE_Depmap_ChemPert_ctrl_9035.h5ad
 # *.json 
 *.h5ad
 *.h5
+*.png
 __pycache__/
 .DS_Store
