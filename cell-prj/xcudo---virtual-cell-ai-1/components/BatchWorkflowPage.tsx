@@ -3,7 +3,7 @@ import { Activity, Download, FlaskConical, Network, Beaker, KeyRound } from 'luc
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip } from 'recharts';
 import { PRESET_CELL_LINES } from '../constants';
 import { Button } from './Button';
-import { Input, RangeSlider } from './Input';
+import { Input } from './Input';
 import { SweepLineChart } from './ResultsChart';
 import { ASCENDService } from '../services/apiLive';
 import {
@@ -12,6 +12,7 @@ import {
   EnrichmentTerm,
   KeyGeneScore,
   MetabolomicsTaskStatusResponse,
+  SweepPoint,
   StringNetworkResponse,
 } from '../types';
 
@@ -32,6 +33,14 @@ const downloadBlob = (blob: Blob, filename: string) => {
   URL.revokeObjectURL(url);
 };
 
+const formatNumericValue = (value: number) => {
+  const rounded = Math.round(value * 1000) / 1000;
+  if (Number.isInteger(rounded)) {
+    return rounded.toString();
+  }
+  return rounded.toFixed(3).replace(/\.?0+$/, '');
+};
+
 export const BatchWorkflowPage: React.FC<BatchWorkflowPageProps> = ({ isDark }) => {
   const [smiles, setSmiles] = useState<string>('CC(=O)OC1=CC=CC=C1C(=O)O');
   const [cellLineId, setCellLineId] = useState<string>(PRESET_CELL_LINES[0].id);
@@ -48,7 +57,8 @@ export const BatchWorkflowPage: React.FC<BatchWorkflowPageProps> = ({ isDark }) 
   const [enrichmentLibrary, setEnrichmentLibrary] = useState<string>('GO_Biological_Process_2021');
   const [enrichmentTopGenes, setEnrichmentTopGenes] = useState<number>(200);
 
-  const [sweepResults, setSweepResults] = useState<any[] | null>(null);
+  const [sweepResults, setSweepResults] = useState<SweepPoint[] | null>(null);
+  const [resolvedSweepPayload, setResolvedSweepPayload] = useState<BatchSweepRequest | null>(null);
   const [sweepTopGenes, setSweepTopGenes] = useState<string[]>([]);
   const [metabolomicsStatus, setMetabolomicsStatus] = useState<MetabolomicsTaskStatusResponse | null>(null);
   const [metabolomicsJobId, setMetabolomicsJobId] = useState<string | null>(null);
@@ -73,6 +83,8 @@ export const BatchWorkflowPage: React.FC<BatchWorkflowPageProps> = ({ isDark }) 
     },
   };
 
+  const displayedSweepPayload = resolvedSweepPayload ?? sweepPayload;
+
   const enrichmentChart = useMemo(() => {
     return enrichment
       .slice(0, 12)
@@ -83,10 +95,33 @@ export const BatchWorkflowPage: React.FC<BatchWorkflowPageProps> = ({ isDark }) 
       .reverse();
   }, [enrichment]);
 
+  const snapshotOptions = useMemo(() => {
+    if (!sweepResults?.length || !resolvedSweepPayload) {
+      return [];
+    }
+
+    const unit = resolvedSweepPayload.sweepVariable === 'dose' ? 'uM' : 'h';
+    const fixedLabel = resolvedSweepPayload.sweepVariable === 'dose'
+      ? `Time ${formatNumericValue(resolvedSweepPayload.fixedParamValue)} h`
+      : `Dose ${formatNumericValue(resolvedSweepPayload.fixedParamValue)} uM`;
+
+    return sweepResults.map((point, index) => ({
+      key: `${index}-${point.xValue}`,
+      xValue: point.xValue,
+      title: `${resolvedSweepPayload.sweepVariable === 'dose' ? 'Dose' : 'Time'} ${formatNumericValue(point.xValue)} ${unit}`,
+      subtitle: fixedLabel,
+      index,
+    }));
+  }, [resolvedSweepPayload, sweepResults]);
+
   const axisColor = isDark ? '#94a3b8' : '#64748b';
   const gridColor = isDark ? '#1e293b' : '#e2e8f0';
 
   const runStep1Sweep = async () => {
+    const payloadForRun: BatchSweepRequest = {
+      ...sweepPayload,
+      range: { ...sweepPayload.range },
+    };
     setLoadingStep('step1');
     setErrorMsg(null);
     setMetabolomicsStatus(null);
@@ -97,15 +132,17 @@ export const BatchWorkflowPage: React.FC<BatchWorkflowPageProps> = ({ isDark }) 
     setPpi(null);
     setKeyGenes([]);
     try {
-      const response = await ASCENDService.predictBatchSweep(sweepPayload);
+      const response = await ASCENDService.predictBatchSweep(payloadForRun);
       if (response.type !== 'sweep' || !Array.isArray(response.data)) {
         throw new Error('Unexpected sweep response format.');
       }
-      setSweepResults(response.data);
+      setSweepResults(response.data as SweepPoint[]);
+      setResolvedSweepPayload(payloadForRun);
       setSweepTopGenes(response.topGenes ?? []);
-      setSnapshotValue(rangeStart);
+      setSnapshotValue(response.data[0]?.xValue ?? payloadForRun.range.start);
     } catch (err: any) {
       setSweepResults(null);
+      setResolvedSweepPayload(null);
       setErrorMsg(err?.message ?? 'Step 1 failed.');
     } finally {
       setLoadingStep(null);
@@ -113,9 +150,13 @@ export const BatchWorkflowPage: React.FC<BatchWorkflowPageProps> = ({ isDark }) 
   };
 
   const downloadAllTranscriptomics = async () => {
+    if (!resolvedSweepPayload) {
+      setErrorMsg('Run Step 1 first.');
+      return;
+    }
     try {
-      const blob = await ASCENDService.fetchSweepMetabolomicsCsv(sweepPayload);
-      const filename = `batch_transcriptomics_${sweepVariable}_${rangeStart}-${rangeEnd}_${rangeSteps}.csv`;
+      const blob = await ASCENDService.fetchSweepMetabolomicsCsv(resolvedSweepPayload);
+      const filename = `batch_transcriptomics_${resolvedSweepPayload.sweepVariable}_${resolvedSweepPayload.range.start}-${resolvedSweepPayload.range.end}_${resolvedSweepPayload.range.steps}.csv`;
       downloadBlob(blob, filename);
     } catch (err: any) {
       setErrorMsg(err?.message ?? 'Failed to download transcriptomics matrix.');
@@ -123,17 +164,17 @@ export const BatchWorkflowPage: React.FC<BatchWorkflowPageProps> = ({ isDark }) 
   };
 
   const runStep2Metabolomics = async () => {
-    if (!sweepResults?.length) {
+    if (!sweepResults?.length || !resolvedSweepPayload) {
       setErrorMsg('Run Step 1 first.');
       return;
     }
     setLoadingStep('step2');
     setErrorMsg(null);
     try {
-      const blob = await ASCENDService.fetchSweepMetabolomicsCsv(sweepPayload);
+      const blob = await ASCENDService.fetchSweepMetabolomicsCsv(resolvedSweepPayload);
       const file = new File(
         [blob],
-        `metabolomics_input_${sweepVariable}_${rangeStart}-${rangeEnd}_${rangeSteps}.csv`,
+        `metabolomics_input_${resolvedSweepPayload.sweepVariable}_${resolvedSweepPayload.range.start}-${resolvedSweepPayload.range.end}_${resolvedSweepPayload.range.steps}.csv`,
         { type: 'text/csv' },
       );
       const started = await ASCENDService.startMetabolomicsAnalysis({
@@ -159,20 +200,23 @@ export const BatchWorkflowPage: React.FC<BatchWorkflowPageProps> = ({ isDark }) 
     }
   };
 
-  const runStep3Snapshot = async () => {
-    if (!sweepResults?.length) {
+  const runStep3Snapshot = async (selectedSnapshotValue: number = snapshotValue) => {
+    if (!sweepResults?.length || !resolvedSweepPayload) {
       setErrorMsg('Run Step 1 first.');
       return;
     }
     setLoadingStep('step3');
     setErrorMsg(null);
+    setSnapshotValue(selectedSnapshotValue);
+    setSnapshot(null);
+    setSnapshotFlux({});
     setEnrichment([]);
     setPpi(null);
     setKeyGenes([]);
     try {
       const response = await ASCENDService.getBatchSnapshot({
-        ...sweepPayload,
-        snapshotValue,
+        ...resolvedSweepPayload,
+        snapshotValue: selectedSnapshotValue,
       });
       setSnapshot(response);
       if (metabolomicsJobId) {
@@ -355,7 +399,7 @@ export const BatchWorkflowPage: React.FC<BatchWorkflowPageProps> = ({ isDark }) 
             <SweepLineChart
               data={sweepResults as any}
               isDark={isDark}
-              xAxisLabel={sweepVariable === 'dose' ? 'Dose (uM)' : 'Time (h)'}
+              xAxisLabel={displayedSweepPayload.sweepVariable === 'dose' ? 'Dose (uM)' : 'Time (h)'}
             />
           ) : null}
         </section>
@@ -419,14 +463,48 @@ export const BatchWorkflowPage: React.FC<BatchWorkflowPageProps> = ({ isDark }) 
             </h2>
             <Button onClick={runStep3Snapshot} isLoading={loadingStep === 'step3'}>Run Step 3</Button>
           </div>
-          <RangeSlider
-            label={sweepVariable === 'dose' ? 'Snapshot Dose' : 'Snapshot Time'}
-            min={Math.min(rangeStart, rangeEnd)}
-            max={Math.max(rangeStart, rangeEnd)}
-            unit={sweepVariable === 'dose' ? 'uM' : 'h'}
-            value={snapshotValue}
-            onChange={(e) => setSnapshotValue(Number(e.target.value))}
-          />
+          {snapshotOptions.length > 0 ? (
+            <div className="space-y-4">
+              <p className="text-sm text-slate-600 dark:text-slate-300">
+                Click one of the generated {displayedSweepPayload.sweepVariable === 'dose' ? 'dose levels' : 'time points'} from Step 1 to load that exact snapshot.
+              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
+                {snapshotOptions.map((option) => {
+                  const isSelected = option.xValue === snapshotValue;
+                  return (
+                    <button
+                      key={option.key}
+                      type="button"
+                      onClick={() => void runStep3Snapshot(option.xValue)}
+                      disabled={loadingStep === 'step3'}
+                      className={[
+                        'rounded-xl border p-4 text-left transition-all duration-200',
+                        'focus:outline-none focus:ring-2 focus:ring-cyan-500/50',
+                        loadingStep === 'step3' ? 'cursor-not-allowed opacity-70' : 'hover:-translate-y-0.5 hover:border-cyan-400/70',
+                        isSelected
+                          ? 'border-cyan-500 bg-cyan-50 dark:bg-cyan-950/30 dark:border-cyan-400'
+                          : 'border-slate-200 bg-slate-50 dark:bg-slate-950/40 dark:border-slate-800',
+                      ].join(' ')}
+                    >
+                      <div className="text-[11px] uppercase tracking-[0.22em] text-slate-500 dark:text-slate-400">
+                        Option {option.index + 1}
+                      </div>
+                      <div className="mt-2 text-sm font-semibold text-slate-900 dark:text-white">
+                        {option.title}
+                      </div>
+                      <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                        {option.subtitle}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ) : (
+            <p className="text-sm text-slate-500 dark:text-slate-400">
+              Run Step 1 to generate discrete snapshot points for selection.
+            </p>
+          )}
           {snapshot ? (
             <p className="text-sm text-slate-600 dark:text-slate-300">
               Snapshot selected: x={snapshot.xValue}, time={snapshot.time}h, dose={snapshot.dose}uM, point={snapshot.cellId}
